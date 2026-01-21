@@ -2,17 +2,18 @@
 Fractal training script for Nano-Fractal hybrid model.
 
 Supports:
-1. Matryoshka training with dimension sampling
-2. Energy penalty for compute minimization
-3. Think token training
-4. Per-layer probe training
+1. Progressive training: 6.4B (2048) → 9.3B (2560) → 20B (4096)
+2. Matryoshka training with dimension sampling  
+3. Energy penalty for compute minimization
+4. Per-layer probes for adaptive capacity
 
 Usage:
-    # Local smoke test
-    python -m scripts.fractal_train --depth=8 --num-iterations=20
+    # Stage 1: Train 6.4B model
+    torchrun --nproc_per_node=8 -m scripts.fractal_train \
+        --checkpoint ~/.cache/nanochat/hybrid_checkpoints/d32_2048/model.pt
     
-    # Distributed training
-    torchrun --nproc_per_node=8 -m scripts.fractal_train
+    # Local smoke test (synthetic data)
+    python -m scripts.fractal_train --depth=4 --num-iterations=5
 """
 
 import argparse
@@ -57,12 +58,12 @@ parser.add_argument("--depth", type=int, default=32, help="number of attention l
 parser.add_argument("--n-mamba", type=int, default=32, help="number of mamba layers")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max sequence length")
 parser.add_argument("--head-dim", type=int, default=128, help="head dimension")
-parser.add_argument("--base-dim", type=int, default=2048, help="base model dimension")
-parser.add_argument("--expanded-dim", type=int, default=4096, help="expanded model dimension")
+parser.add_argument("--base-dim", type=int, default=2048, help="original nanochat dimension")
+parser.add_argument("--expanded-dim", type=int, default=0, help="expanded model dimension (0=auto from checkpoint)")
 
 # Matryoshka
 parser.add_argument("--matryoshka", action="store_true", help="enable Matryoshka training")
-parser.add_argument("--dim-levels", type=str, default="128,512,1024,2048,4096", help="comma-separated dim levels")
+parser.add_argument("--dim-levels", type=str, default="", help="comma-separated dim levels (auto if empty)")
 parser.add_argument("--energy-lambda", type=float, default=0.01, help="energy penalty weight")
 parser.add_argument("--sample-dim", action="store_true", help="sample one dim level per batch")
 
@@ -103,11 +104,38 @@ else:
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 
 # -----------------------------------------------------------------------------
+# Load config from checkpoint if available
+checkpoint_config = None
+if args.checkpoint and args.checkpoint.exists():
+    config_path = args.checkpoint.parent / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            checkpoint_config = json.load(f)
+        print0(f"Loaded config from checkpoint: {config_path}")
+
+# Determine expanded dimension
+if args.expanded_dim > 0:
+    expanded_dim = args.expanded_dim
+elif checkpoint_config and 'n_embd_expanded' in checkpoint_config:
+    expanded_dim = checkpoint_config['n_embd_expanded']
+else:
+    expanded_dim = 2048  # Stage 1 default
+
+print0(f"Using expanded dimension: {expanded_dim}")
+
+# Determine dim levels (filter to not exceed expanded_dim)
+if args.dim_levels:
+    dim_levels = [int(d) for d in args.dim_levels.split(",")]
+else:
+    # Auto levels based on expanded dim
+    all_levels = [128, 256, 512, 1024, 2048, 2560, 3072, 4096]
+    dim_levels = [d for d in all_levels if d <= expanded_dim]
+
+dim_levels = [d for d in dim_levels if d <= expanded_dim]  # Safety filter
+print0(f"Matryoshka dim levels: {dim_levels}")
+
 # Model setup
 print0("Setting up model...")
-
-dim_levels = [int(d) for d in args.dim_levels.split(",")]
-print0(f"Matryoshka dim levels: {dim_levels}")
 
 # Create config
 config = HybridConfig(
@@ -115,10 +143,10 @@ config = HybridConfig(
     vocab_size=32768,
     n_layer=args.depth,
     n_mamba_layer=args.n_mamba,
-    n_head=args.expanded_dim // args.head_dim,
-    n_kv_head=args.expanded_dim // args.head_dim,
+    n_head=expanded_dim // args.head_dim,
+    n_kv_head=expanded_dim // args.head_dim,
     n_embd=args.base_dim,
-    n_embd_expanded=args.expanded_dim,
+    n_embd_expanded=expanded_dim,
     mlp_dim_levels=dim_levels,
 )
 
