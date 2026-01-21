@@ -10,30 +10,30 @@
 - 📐 **Matryoshka Dimensions**: Ghost (128) → God (4096) dynamic scaling
 - 🧠 **Neural Confidence Probes**: Per-layer capacity allocation
 - ⚡ **Energy Penalty Loss**: "Lazy but correct" compute minimization
-- 🪆 **Progressive Training**: 4B → 9B → 20B staged expansion
+- 🪆 **Progressive Training**: 6B → 9B → 20B staged expansion
 
 ## Architecture
 
 ```
 nanochat-d32 (1.9B, 32 layers, dim=2048)
     ↓ Surgery (add 32 Mamba layers)
-Stage 1: 4B  (dim=2048)  ← No expansion, just add Mamba
+Stage 1: 6.4B  (dim=2048)  ← Add Mamba, no expansion
     ↓ Progressive expand
-Stage 2: 9B  (dim=2560)  
+Stage 2: 9.3B  (dim=2560)  
     ↓ Progressive expand
-Stage 3: 20B (dim=4096)
+Stage 3: 20B   (dim=4096)
 ```
 
 ## Training Cost Estimates
 
-| Stage | Model Size | New Params | Tokens | Hours (8×H100) | Cost |
-|-------|------------|------------|--------|----------------|------|
-| 1 | 4B | ~2B | 40B | 25h | $600 |
-| 2 | 9B | ~5B | 100B | 60h | $1,500 |
-| 3 | 20B | ~11B | 220B | 130h | $3,200 |
-| **Total** | **20B** | | | **215h** | **~$5,300** |
+| Stage | Model Size | Dim | Hours (8×H100) | Est. Cost |
+|-------|------------|-----|----------------|-----------|
+| 1 | 6.4B | 2048 | 40h | $1,000 |
+| 2 | 9.3B | 2560 | 50h | $1,200 |
+| 3 | 20B | 4096 | 100h | $2,400 |
+| **Total** | | | **190h** | **~$4,600** |
 
-*Or stop at any stage - 4B alone costs ~$600*
+*Or stop at any stage - 6.4B alone costs ~$1,000*
 
 ## Quick Start
 
@@ -42,7 +42,7 @@ Stage 3: 20B (dim=4096)
 huggingface-cli download karpathy/nanochat-d32 \
     --local-dir ~/.cache/nanochat/chatsft_checkpoints/d32
 
-# 2. Stage 1: Create 4B hybrid (no dim expansion)
+# 2. Stage 1: Create 6.4B hybrid
 python -m scripts.surgery --new-dim=2048
 
 # 3. Train Stage 1
@@ -50,10 +50,8 @@ torchrun --nproc_per_node=8 -m scripts.fractal_train \
     --checkpoint ~/.cache/nanochat/hybrid_checkpoints/d32_2048/model.pt \
     --expanded-dim=2048 --matryoshka --sample-dim
 
-# 4. Stage 2: Expand trained 4B → 9B
+# 4. Stage 2: Expand trained 6.4B → 9.3B
 python -m scripts.surgery --expand-from=2048 --new-dim=2560
-
-# 5. Train Stage 2, then expand to 20B...
 ```
 
 ## New Files
