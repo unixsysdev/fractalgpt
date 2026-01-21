@@ -17,13 +17,23 @@
 ```
 nanochat-d32 (1.9B)
     ↓ Surgery (expand + add Mamba)
-Stage 1: 6B  (dim=2560)  ← Train ~$300
+Stage 1: 6B  (dim=2560)  ← Train ~$1,200
     ↓ Progressive expand
-Stage 2: 10B (dim=3072)  ← Train ~$300  
+Stage 2: 10B (dim=3072)  ← Train ~$700  
     ↓ Progressive expand
-Stage 3: 20B (dim=4096)  ← Train ~$300
-    Total: ~$900 for 20B model
+Stage 3: 20B (dim=4096)  ← Train ~$1,500
 ```
+
+## Training Cost Estimates
+
+| Stage | Model Size | New Params | Tokens | Hours (8×H100) | Cost |
+|-------|------------|------------|--------|----------------|------|
+| 1 | 6B | ~4B | 80B | 50h | $1,200 |
+| 2 | 10B | ~2B | 40B | 30h | $700 |
+| 3 | 20B | ~5B | 100B | 60h | $1,500 |
+| **Total** | **20B** | | | **140h** | **~$3,400** |
+
+*Still 1000× cheaper than training 20B from scratch (~$10M+)*
 
 ## Quick Start
 
@@ -40,11 +50,10 @@ torchrun --nproc_per_node=8 -m scripts.fractal_train \
     --checkpoint ~/.cache/nanochat/hybrid_checkpoints/d32_2560/model.pt \
     --expanded-dim=2560 --matryoshka --sample-dim
 
-# 4. Stage 2: Expand to 10B
+# 4. Stage 2: Expand trained 6B → 10B
 python -m scripts.surgery --expand-from=2560 --new-dim=3072
 
-# 5. Train Stage 2...
-# 6. Stage 3: Expand to 20B and train...
+# 5. Train Stage 2, then expand to 20B...
 ```
 
 ## New Files
