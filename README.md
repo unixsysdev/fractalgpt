@@ -1,69 +1,78 @@
-# Nano-Fractal 4B
+# Nano-Fractal
 
-> Emergent Fractal Intelligence: A hybrid Mamba-Transformer with dynamic Matryoshka scaling.
+> Emergent Fractal Intelligence: Hybrid Mamba-Transformer with dynamic Matryoshka scaling.
 
-**Fork of [karpathy/nanochat](https://github.com/karpathy/nanochat)** — Extended with:
+**Fork of [karpathy/nanochat](https://github.com/karpathy/nanochat)**
 
-- 🧬 **Hybrid Architecture**: 32 Attention + 32 Mamba layers (64 total, ~4B params)
+## What's New
+
+- 🧬 **Hybrid Architecture**: 32 Attention + 32 Mamba layers (64 total)
 - 📐 **Matryoshka Dimensions**: Ghost (128) → God (4096) dynamic scaling
-- 🧠 **Neural Confidence Probes**: Per-layer topological signals for capacity allocation
-- ⚡ **Energy Penalty Loss**: Forces compute minimization ("lazy but correct")
+- 🧠 **Neural Confidence Probes**: Per-layer capacity allocation
+- ⚡ **Energy Penalty Loss**: "Lazy but correct" compute minimization
+- 🪆 **Progressive Training**: 6B → 10B → 20B staged expansion
 
 ## Architecture
 
 ```
-nanochat-d32 (1.9B) → Surgery → Nano-Fractal 4B
-├── 32 Attention layers (pretrained, expanded 2048→4096)
-├── 32 Mamba layers (new, interleaved)
-├── MatryoshkaMLP: [128, 512, 1024, 2048, 4096]
-├── MatryoshkaKV: [32, 64, 128, 256]
-└── ConfidenceProbe per layer (variance, agreement, spread)
+nanochat-d32 (1.9B)
+    ↓ Surgery (expand + add Mamba)
+Stage 1: 6B  (dim=2560)  ← Train ~$300
+    ↓ Progressive expand
+Stage 2: 10B (dim=3072)  ← Train ~$300  
+    ↓ Progressive expand
+Stage 3: 20B (dim=4096)  ← Train ~$300
+    Total: ~$900 for 20B model
+```
+
+## Quick Start
+
+```bash
+# 1. Download nanochat-d32 base
+huggingface-cli download karpathy/nanochat-d32 \
+    --local-dir ~/.cache/nanochat/chatsft_checkpoints/d32
+
+# 2. Stage 1: Create 6B hybrid
+python -m scripts.surgery --new-dim=2560
+
+# 3. Train Stage 1
+torchrun --nproc_per_node=8 -m scripts.fractal_train \
+    --checkpoint ~/.cache/nanochat/hybrid_checkpoints/d32_2560/model.pt \
+    --expanded-dim=2560 --matryoshka --sample-dim
+
+# 4. Stage 2: Expand to 10B
+python -m scripts.surgery --expand-from=2560 --new-dim=3072
+
+# 5. Train Stage 2...
+# 6. Stage 3: Expand to 20B and train...
 ```
 
 ## New Files
 
 | File | Purpose |
 |------|---------|
-| `nanochat/mamba_block.py` | Mamba layer with SSM fallback |
-| `nanochat/confidence_probe.py` | Neural probes using topological signals |
-| `nanochat/matryoshka.py` | Dimension slicing + energy penalty |
-| `nanochat/hybrid_gpt.py` | HybridGPT (interleaved Mamba+Attention) |
-| `scripts/surgery.py` | Convert nanochat-d32 → hybrid |
-| `scripts/fractal_train.py` | Training with Matryoshka loss |
+| `nanochat/hybrid_gpt.py` | HybridGPT (Mamba+Attention) |
+| `nanochat/mamba_block.py` | Mamba with SSM fallback |
+| `nanochat/matryoshka.py` | Dimension slicing + energy loss |
+| `nanochat/confidence_probe.py` | Neural probes |
+| `scripts/surgery.py` | Create/expand hybrid checkpoints |
+| `scripts/fractal_train.py` | Matryoshka training |
 
-## Quick Start
+## Matryoshka Levels
 
-```bash
-# 1. Download base model
-huggingface-cli download karpathy/nanochat-d32 --local-dir ~/.cache/nanochat/chatsft_checkpoints/d32
+| Mode | Dim | Compute | Use Case |
+|------|-----|---------|----------|
+| Ghost | 128 | ~0.1% | Trivial tasks |
+| Whisper | 512 | ~4% | Simple Q&A |
+| Normal | 2048 | ~25% | General use |
+| Think | 4096 | 100% | Complex reasoning |
 
-# 2. Run surgery (creates 4B hybrid)
-python -m scripts.surgery
+## Mamba:Attention Ratio
 
-# 3. Train on 8×H100
-torchrun --nproc_per_node=8 -m scripts.fractal_train \
-    --checkpoint ~/.cache/nanochat/hybrid_checkpoints/d32/model_surgery.pt \
-    --matryoshka --sample-dim \
-    --num-iterations=5000
-```
-
-## Ghost → God Spectrum
-
-| Mode | MLP Dim | KV Dim | Compute |
-|------|---------|--------|---------|
-| Ghost | 128 | 32 | ~0.1% |
-| Whisper | 512 | 64 | ~1.5% |
-| Normal | 2048 | 128 | ~25% |
-| Think | 4096 | 256 | ~100% |
-
-The model learns *when* to scale up based on task difficulty.
-
-## Training Cost
-
-~$200 total on 8×H100 (~13 hours):
-- Phase 1: Expand + Initialize (~2 hrs)
-- Phase 2: Matryoshka Training (~6 hrs)  
-- Phase 3: Emergent Think Training (~3 hrs)
+We use 1:1 interleaved (32 Mamba + 32 Attention). Research suggests:
+- 4:1 Mamba:Attention common (Jamba)
+- 1:1 simpler, works well for our scale
+- Mamba provides O(n) efficiency for long context (128K feasible)
 
 ---
 

@@ -1,10 +1,19 @@
 """
-Surgery script to convert nanochat-d32 to HybridGPT.
+Surgery script with progressive expansion support.
 
-This script:
-1. Loads the pretrained nanochat-d32 checkpoint (as state_dict, not model)
-2. Creates expanded weight tensors layer-by-layer
-3. Saves the hybrid state dict directly (memory efficient)
+Supports:
+1. Initial surgery: nanochat-d32 → 6B hybrid
+2. Progressive expansion: 6B → 10B → 20B
+
+Usage:
+    # Stage 1: Initial 6B
+    python -m scripts.surgery --new-dim=2560
+    
+    # Stage 2: Expand to 10B
+    python -m scripts.surgery --expand-from=2560 --new-dim=3072
+    
+    # Stage 3: Expand to 20B  
+    python -m scripts.surgery --expand-from=3072 --new-dim=4096
 """
 
 import argparse
@@ -12,7 +21,7 @@ import os
 import json
 import gc
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -34,21 +43,101 @@ def expand_weight(weight: torch.Tensor, target_size: int, dim: int = 0) -> torch
     return torch.cat([weight, padding], dim=dim)
 
 
+def expand_state_dict(
+    src_state: Dict[str, torch.Tensor],
+    old_dim: int,
+    new_dim: int,
+) -> Dict[str, torch.Tensor]:
+    """Expand an existing hybrid state dict to larger dimensions."""
+    dst_state = {}
+    
+    print(f"Expanding from {old_dim} → {new_dim}")
+    
+    for key, tensor in src_state.items():
+        # Identify which dimensions to expand based on tensor shape
+        new_tensor = tensor
+        
+        # Embedding: (vocab, dim)
+        if 'wte.weight' in key or 'value_embeds' in key:
+            if tensor.size(-1) == old_dim:
+                new_tensor = expand_weight(tensor, new_dim, dim=-1)
+        
+        # LM head: (vocab, dim)
+        elif 'lm_head.weight' in key:
+            if tensor.size(-1) == old_dim:
+                new_tensor = expand_weight(tensor, new_dim, dim=-1)
+        
+        # Attention Q/K/V: (out, in)
+        elif any(x in key for x in ['c_q.weight', 'c_k.weight', 'c_v.weight']):
+            n_head_mult = tensor.size(0) // (old_dim // 16)  # infer head multiplier
+            new_head_dim = new_dim // 16
+            new_out = n_head_mult * new_head_dim
+            new_tensor = expand_weight(tensor, new_dim, dim=1)  # input
+            new_tensor = expand_weight(new_tensor, new_out, dim=0)  # output
+        
+        # Attention proj: (dim, dim)
+        elif 'c_proj.weight' in key and 'attn' in key:
+            # Input is n_head * head_dim, output is dim
+            new_tensor = expand_weight(tensor, new_dim * (tensor.size(1) // old_dim), dim=1)
+            new_tensor = expand_weight(new_tensor, new_dim, dim=0)
+        
+        # MLP: c_fc (4*dim, dim), c_proj (dim, 4*dim)
+        elif 'mlp.c_fc.weight' in key:
+            new_tensor = expand_weight(tensor, new_dim, dim=1)  # input
+            new_tensor = expand_weight(new_tensor, 4 * new_dim, dim=0)  # output
+        elif 'mlp.c_proj.weight' in key:
+            new_tensor = expand_weight(tensor, 4 * new_dim, dim=1)  # input
+            new_tensor = expand_weight(new_tensor, new_dim, dim=0)  # output
+        
+        # Mamba: in_proj (2*d_inner, dim), out_proj (dim, d_inner)
+        elif 'mamba.layer.in_proj.weight' in key:
+            d_inner_old = tensor.size(0) // 2
+            d_inner_new = new_dim * 2  # expand=2
+            new_tensor = expand_weight(tensor, new_dim, dim=1)
+            new_tensor = expand_weight(new_tensor, d_inner_new * 2, dim=0)
+        elif 'mamba.layer.out_proj.weight' in key:
+            d_inner_new = new_dim * 2
+            new_tensor = expand_weight(tensor, d_inner_new, dim=1)
+            new_tensor = expand_weight(new_tensor, new_dim, dim=0)
+        
+        # Mamba conv1d, dt_proj, etc - expand d_inner
+        elif 'mamba.layer.conv1d' in key:
+            d_inner_new = new_dim * 2
+            new_tensor = expand_weight(tensor, d_inner_new, dim=0)
+        elif 'mamba.layer.dt_proj' in key:
+            d_inner_new = new_dim * 2
+            if 'weight' in key:
+                new_tensor = expand_weight(tensor, d_inner_new, dim=0)
+                new_tensor = expand_weight(new_tensor, d_inner_new, dim=1)
+            else:
+                new_tensor = expand_weight(tensor, d_inner_new, dim=0)
+        elif 'mamba.layer.A_log' in key or 'mamba.layer.D' in key:
+            d_inner_new = new_dim * 2
+            new_tensor = expand_weight(tensor, d_inner_new, dim=0)
+        
+        # Probes and think_detector stay same size (small)
+        # resid_lambdas, x0_lambdas stay same (per-layer)
+        
+        dst_state[key] = new_tensor
+        
+        if new_tensor.shape != tensor.shape:
+            print(f"  {key}: {tensor.shape} → {new_tensor.shape}")
+    
+    gc.collect()
+    return dst_state
+
+
 def build_hybrid_state_dict(
     src_state: Dict[str, torch.Tensor],
     src_config: GPTConfig,
     old_dim: int = 2048,
-    new_dim: int = 4096,
+    new_dim: int = 2560,
 ) -> Dict[str, torch.Tensor]:
-    """
-    Build hybrid state dict from source state dict.
-    
-    Memory efficient: works with tensors, not full models.
-    """
+    """Build hybrid state dict from nanochat source (initial surgery)."""
     dst_state = {}
     
     n_layer = src_config.n_layer
-    n_mamba = n_layer  # Same number of mamba layers
+    n_mamba = n_layer
     n_head = src_config.n_head
     n_kv_head = src_config.n_kv_head
     old_head_dim = old_dim // n_head
@@ -57,29 +146,28 @@ def build_hybrid_state_dict(
     padded_vocab = 32768
     
     print(f"Building hybrid state dict: {n_layer} attn + {n_mamba} mamba layers")
+    print(f"Dimension expansion: {old_dim} → {new_dim}")
     
-    # Embedding: expand dim
+    # Embedding
     print("  Expanding embedding...")
     wte = src_state['transformer.wte.weight']
     dst_state['transformer.wte.weight'] = expand_weight(wte, new_dim, dim=1)
     del wte; gc.collect()
     
-    # LM head: expand input dim
+    # LM head
     print("  Expanding lm_head...")
     lm_head = src_state['lm_head.weight']
     dst_state['lm_head.weight'] = expand_weight(lm_head, new_dim, dim=1)
     del lm_head; gc.collect()
     
-    # Per-layer scalars: expand to n_layer + n_mamba
+    # Per-layer scalars
     total_layers = n_layer + n_mamba
     dst_state['resid_lambdas'] = torch.ones(total_layers)
     dst_state['x0_lambdas'] = torch.zeros(total_layers)
     
-    # Copy scalars from source where applicable
     src_resid = src_state.get('resid_lambdas', torch.ones(n_layer))
     src_x0 = src_state.get('x0_lambdas', torch.zeros(n_layer))
     
-    # Interleave: attention at even indices
     attn_idx = 0
     for i in range(total_layers):
         if i % 2 == 0 and attn_idx < n_layer:
@@ -89,6 +177,11 @@ def build_hybrid_state_dict(
     
     # Process blocks
     src_block_idx = 0
+    d_inner = new_dim * 2  # Mamba expand=2
+    d_state = 16
+    d_conv = 4
+    std = (3 ** 0.5) * (new_dim ** -0.5)
+    
     for block_idx in range(total_layers):
         is_attention = (block_idx % 2 == 0) and (src_block_idx < n_layer)
         prefix = f'blocks.{block_idx}'
@@ -97,61 +190,52 @@ def build_hybrid_state_dict(
             print(f"  Block {block_idx}: Attention (from src {src_block_idx})")
             src_prefix = f'transformer.h.{src_block_idx}'
             
-            # Attention Q, K, V, proj
+            # Q, K, V
             for name, out_mult in [('c_q', n_head), ('c_k', n_kv_head), ('c_v', n_kv_head)]:
                 src_key = f'{src_prefix}.attn.{name}.weight'
                 if src_key in src_state:
                     w = src_state[src_key]
-                    # Expand in and out dimensions
-                    w = expand_weight(w, new_dim, dim=1)  # input
-                    w = expand_weight(w, out_mult * new_head_dim, dim=0)  # output
+                    w = expand_weight(w, new_dim, dim=1)
+                    w = expand_weight(w, out_mult * new_head_dim, dim=0)
                     dst_state[f'{prefix}.attn.{name}.weight'] = w
             
-            # c_proj: (n_embd, n_head * head_dim) 
+            # c_proj
             src_key = f'{src_prefix}.attn.c_proj.weight'
             if src_key in src_state:
                 w = src_state[src_key]
-                w = expand_weight(w, n_head * new_head_dim, dim=1)  # input
-                w = expand_weight(w, new_dim, dim=0)  # output
+                w = expand_weight(w, n_head * new_head_dim, dim=1)
+                w = expand_weight(w, new_dim, dim=0)
                 dst_state[f'{prefix}.attn.c_proj.weight'] = w
             
-            # VE gate (if exists) - small, just copy
+            # VE gate
             src_key = f'{src_prefix}.attn.ve_gate.weight'
             if src_key in src_state:
                 dst_state[f'{prefix}.attn.ve_gate.weight'] = src_state[src_key].clone()
             
-            # MLP: c_fc (4*n_embd, n_embd) and c_proj (n_embd, 4*n_embd)
+            # MLP
             src_key = f'{src_prefix}.mlp.c_fc.weight'
             if src_key in src_state:
                 w = src_state[src_key]
-                w = expand_weight(w, new_dim, dim=1)  # input
-                w = expand_weight(w, 4 * new_dim, dim=0)  # output
+                w = expand_weight(w, new_dim, dim=1)
+                w = expand_weight(w, 4 * new_dim, dim=0)
                 dst_state[f'{prefix}.mlp.c_fc.weight'] = w
             
             src_key = f'{src_prefix}.mlp.c_proj.weight'
             if src_key in src_state:
                 w = src_state[src_key]
-                w = expand_weight(w, 4 * new_dim, dim=1)  # input
-                w = expand_weight(w, new_dim, dim=0)  # output
+                w = expand_weight(w, 4 * new_dim, dim=1)
+                w = expand_weight(w, new_dim, dim=0)
                 dst_state[f'{prefix}.mlp.c_proj.weight'] = w
             
             src_block_idx += 1
         else:
             print(f"  Block {block_idx}: Mamba (fresh init)")
-            # Mamba blocks: initialize fresh (small std)
-            d_inner = new_dim * 2  # expand=2
-            d_state = 16
-            d_conv = 4
-            
-            std = (3 ** 0.5) * (new_dim ** -0.5)
             
             # Mamba projections
             dst_state[f'{prefix}.mamba.layer.in_proj.weight'] = torch.randn(d_inner * 2, new_dim) * std
             dst_state[f'{prefix}.mamba.layer.out_proj.weight'] = torch.zeros(new_dim, d_inner)
             dst_state[f'{prefix}.mamba.layer.conv1d.weight'] = torch.randn(d_inner, 1, d_conv) * std
             dst_state[f'{prefix}.mamba.layer.conv1d.bias'] = torch.zeros(d_inner)
-            
-            # SSM params
             dst_state[f'{prefix}.mamba.layer.dt_proj.weight'] = torch.randn(d_inner, d_inner) * std
             dst_state[f'{prefix}.mamba.layer.dt_proj.bias'] = torch.zeros(d_inner)
             dst_state[f'{prefix}.mamba.layer.A_log'] = torch.zeros(d_inner, d_state)
@@ -161,7 +245,7 @@ def build_hybrid_state_dict(
             dst_state[f'{prefix}.mlp.c_fc.weight'] = torch.randn(4 * new_dim, new_dim) * std
             dst_state[f'{prefix}.mlp.c_proj.weight'] = torch.zeros(new_dim, 4 * new_dim)
         
-        # Probe (fresh init for all blocks)
+        # Probe
         dst_state[f'{prefix}.probe.probe.0.weight'] = torch.randn(32, 3) * 0.1
         dst_state[f'{prefix}.probe.probe.0.bias'] = torch.zeros(32)
         dst_state[f'{prefix}.probe.probe.2.weight'] = torch.randn(2, 32) * 0.1
@@ -169,20 +253,17 @@ def build_hybrid_state_dict(
         
         gc.collect()
     
-    # Value embeddings (skip for now, can be initialized later)
-    # They're small anyway
+    # Value embeddings
     kv_dim = n_kv_head * new_head_dim
     for i in range(total_layers):
-        if i % 2 == 0:  # attention blocks
+        if i % 2 == 0:
             dst_state[f'value_embeds.{i}.weight'] = torch.randn(padded_vocab, kv_dim) * 0.01
     
-    # Think detector (fresh init)
+    # Think detector
     dst_state['think_detector.net.0.weight'] = torch.randn(32, 1) * 0.1
     dst_state['think_detector.net.0.bias'] = torch.zeros(32)
     dst_state['think_detector.net.2.weight'] = torch.randn(1, 32) * 0.1
     dst_state['think_detector.net.2.bias'] = torch.zeros(1)
-    
-    # Rotary embeddings are computed at runtime, not stored
     
     return dst_state
 
@@ -191,92 +272,114 @@ def surgery(
     src_checkpoint: Path,
     dst_checkpoint: Path,
     old_dim: int = 2048,
-    new_dim: int = 4096,
+    new_dim: int = 2560,
+    expand_from: Optional[int] = None,
 ):
-    """Perform architecture surgery (memory efficient)."""
-    print(f"Loading source checkpoint: {src_checkpoint}")
+    """
+    Perform architecture surgery.
     
-    # Load just the state dict, not the model
+    If expand_from is set, expands an existing hybrid checkpoint.
+    Otherwise, creates hybrid from nanochat source.
+    """
+    print(f"Loading source checkpoint: {src_checkpoint}")
     src_state = torch.load(src_checkpoint, map_location='cpu', weights_only=True)
     print(f"Source state dict loaded: {len(src_state)} keys")
     
-    # Infer config from state dict
-    wte_shape = src_state['transformer.wte.weight'].shape
-    vocab_size = wte_shape[0]
-    n_embd = wte_shape[1]
+    if expand_from:
+        # Progressive expansion: hybrid → larger hybrid
+        print(f"\n=== Progressive Expansion: {expand_from} → {new_dim} ===")
+        dst_state = expand_state_dict(src_state, expand_from, new_dim)
+    else:
+        # Initial surgery: nanochat → hybrid
+        print(f"\n=== Initial Surgery: nanochat → hybrid@{new_dim} ===")
+        
+        # Infer config
+        wte_shape = src_state['transformer.wte.weight'].shape
+        vocab_size = wte_shape[0]
+        n_embd = wte_shape[1]
+        
+        n_layer = 0
+        while f'transformer.h.{n_layer}.attn.c_q.weight' in src_state:
+            n_layer += 1
+        
+        q_shape = src_state['transformer.h.0.attn.c_q.weight'].shape
+        head_dim = old_dim // 16
+        n_head = q_shape[0] // head_dim
+        
+        src_config = GPTConfig(
+            sequence_len=2048,
+            vocab_size=vocab_size,
+            n_layer=n_layer,
+            n_head=n_head,
+            n_kv_head=n_head,
+            n_embd=n_embd,
+        )
+        
+        print(f"Source config: n_layer={n_layer}, n_embd={n_embd}, n_head={n_head}")
+        dst_state = build_hybrid_state_dict(src_state, src_config, old_dim, new_dim)
     
-    # Count layers
-    n_layer = 0
-    while f'transformer.h.{n_layer}.attn.c_q.weight' in src_state:
-        n_layer += 1
-    
-    # Infer heads from Q shape
-    q_shape = src_state['transformer.h.0.attn.c_q.weight'].shape
-    head_dim = old_dim // 16  # Assume 16 heads for d32
-    n_head = q_shape[0] // head_dim
-    
-    src_config = GPTConfig(
-        sequence_len=2048,
-        vocab_size=vocab_size,
-        n_layer=n_layer,
-        n_head=n_head,
-        n_kv_head=n_head,
-        n_embd=n_embd,
-    )
-    
-    print(f"Inferred config: n_layer={n_layer}, n_embd={n_embd}, n_head={n_head}")
-    
-    # Build hybrid state dict
-    dst_state = build_hybrid_state_dict(src_state, src_config, old_dim, new_dim)
-    
-    # Free source
     del src_state
     gc.collect()
     
     # Save
-    print(f"Saving to {dst_checkpoint}")
+    print(f"\nSaving to {dst_checkpoint}")
     dst_checkpoint.parent.mkdir(parents=True, exist_ok=True)
     torch.save(dst_state, dst_checkpoint)
     
-    # Save config
+    # Save/update config
     config_path = dst_checkpoint.parent / "config.json"
+    config = {
+        'sequence_len': 32768,
+        'vocab_size': 32768,
+        'n_layer': 32,
+        'n_mamba_layer': 32,
+        'n_head': 16,
+        'n_kv_head': 16,
+        'n_embd': 2048,
+        'n_embd_expanded': new_dim,
+        'stage': f'{new_dim}',
+    }
     with open(config_path, 'w') as f:
-        json.dump({
-            'sequence_len': 32768,
-            'vocab_size': vocab_size,
-            'n_layer': n_layer,
-            'n_mamba_layer': n_layer,
-            'n_head': n_head,
-            'n_kv_head': n_head,
-            'n_embd': old_dim,
-            'n_embd_expanded': new_dim,
-        }, f, indent=2)
+        json.dump(config, f, indent=2)
     
-    print("Surgery complete!")
-    print(f"  Saved {len(dst_state)} keys")
-    
-    # Count params
     total_params = sum(t.numel() for t in dst_state.values())
+    print(f"\nSurgery complete!")
+    print(f"  Keys: {len(dst_state)}")
     print(f"  Total params: {total_params:,}")
+    print(f"  Approx size: {total_params / 1e9:.1f}B")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert nanochat-d32 to HybridGPT")
+    parser = argparse.ArgumentParser(description="Convert/expand to HybridGPT")
     parser.add_argument(
         '--src', type=Path,
-        default=Path.home() / '.cache/nanochat/chatsft_checkpoints/d32/model_000650.pt',
-        help='Path to source checkpoint',
+        default=None,
+        help='Path to source checkpoint (auto-detects nanochat vs hybrid)',
     )
     parser.add_argument(
         '--dst', type=Path,
-        default=Path.home() / '.cache/nanochat/hybrid_checkpoints/d32/model_surgery.pt',
-        help='Path to save hybrid checkpoint',
+        default=None,
+        help='Path to save checkpoint',
     )
-    parser.add_argument('--old-dim', type=int, default=2048)
-    parser.add_argument('--new-dim', type=int, default=4096)
+    parser.add_argument('--old-dim', type=int, default=2048,
+                        help='Original nanochat dimension')
+    parser.add_argument('--new-dim', type=int, default=2560,
+                        help='Target dimension')
+    parser.add_argument('--expand-from', type=int, default=None,
+                        help='If set, expand existing hybrid from this dim')
     
     args = parser.parse_args()
-    surgery(args.src, args.dst, args.old_dim, args.new_dim)
+    
+    # Auto paths
+    cache = Path.home() / '.cache/nanochat'
+    if args.expand_from:
+        src = args.src or cache / 'hybrid_checkpoints' / f'd32_{args.expand_from}' / 'model.pt'
+    else:
+        src = args.src or cache / 'chatsft_checkpoints/d32/model_000650.pt'
+    
+    dst = args.dst or cache / 'hybrid_checkpoints' / f'd32_{args.new_dim}' / 'model.pt'
+    
+    surgery(src, dst, args.old_dim, args.new_dim, args.expand_from)
 
 
 if __name__ == '__main__':
