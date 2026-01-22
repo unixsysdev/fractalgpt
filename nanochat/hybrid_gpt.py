@@ -23,7 +23,11 @@ from nanochat.flash_attention import flash_attn
 
 # Import our new modules
 from nanochat.mamba_block import MambaBlock, MambaLayer
-from nanochat.confidence_probe import ConfidenceProbe, LayerProbe, ThinkDetector
+from nanochat.confidence_probe import (
+    ConfidenceProbe, LayerProbe, ThinkDetector,  # Legacy V1
+    LayerDimPredictor, ConfidenceGate, MatryoshkaKVCache,  # V2
+    AdaptiveController,
+)
 from nanochat.matryoshka import (
     MLP_DIM_LEVELS, KV_DIM_LEVELS,
     slice_hidden, pad_hidden, sample_dim_level,
@@ -322,8 +326,23 @@ class HybridGPT(nn.Module):
             if block.is_attention and has_ve(i, n_total)
         })
         
-        # Think detector
+        # Think detector (legacy V1)
         self.think_detector = ThinkDetector(config.n_embd_expanded)
+        
+        # V2: LayerDimPredictor - predicts dims for all layers upfront
+        self.dim_predictor = LayerDimPredictor(
+            n_layers=len(self.blocks),
+            d_model=config.n_embd_expanded,
+            dim_levels=config.mlp_dim_levels,
+        )
+        
+        # V2: ConfidenceGate - unified control for early exit + dim expansion
+        self.confidence_gate = ConfidenceGate(config.n_embd_expanded)
+        
+        # V2: Adaptive inference settings
+        self.exit_threshold = 0.95
+        self.expand_threshold = 0.5
+        self.min_layers_before_exit = len(self.blocks) // 4  # Exit after 25% of layers
         
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 2
@@ -516,6 +535,102 @@ class HybridGPT(nn.Module):
         metrics['total_loss'] = avg_loss.item()
         
         return avg_loss, metrics
+    
+    def forward_v2(
+        self,
+        idx: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        kv_cache=None,
+        use_adaptive: bool = True,
+    ) -> Tuple[torch.Tensor, Dict]:
+        """
+        V2 Forward pass with LayerDimPredictor + ConfidenceGate.
+        
+        Features:
+        - Per-layer dimension prediction (upfront, GPU-friendly)
+        - Early exit when confident
+        - Dimension expansion when struggling near end
+        
+        Args:
+            idx: Input token ids (B, T)
+            targets: Target token ids for loss (B, T)
+            kv_cache: Optional KV cache for inference
+            use_adaptive: Enable adaptive early exit / expansion
+        """
+        B, T = idx.size()
+        
+        # Rotary embeddings
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        
+        # Embedding
+        x = self.transformer.wte(idx)
+        x = norm(x)
+        x0 = x
+        
+        # V2: Predict per-layer dimensions upfront
+        layer_dims = self.dim_predictor(x)
+        
+        metrics = {
+            'layer_dims': layer_dims.copy(),
+            'confidences': [],
+            'exit_layer': len(self.blocks),
+            'expanded': False,
+        }
+        
+        # Forward through blocks with gate control
+        for i, block in enumerate(self.blocks):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            
+            # Get value embedding if attention block
+            ve = None
+            if block.is_attention and str(i) in self.value_embeds:
+                ve = self.value_embeds[str(i)](idx)
+            
+            # Forward block with predicted dimension
+            x, _ = block(
+                x, ve, cos_sin, self.window_sizes[i], kv_cache,
+                active_dim=layer_dims[i],
+            )
+            
+            # V2: Check confidence gate
+            if use_adaptive:
+                confidence = self.confidence_gate(x)
+                metrics['confidences'].append(confidence.mean().item())
+                
+                # Early exit check
+                if i >= self.min_layers_before_exit:
+                    if confidence.mean() > self.exit_threshold:
+                        metrics['exit_layer'] = i + 1
+                        break
+                
+                # Expansion check (near end with low confidence)
+                if i >= len(self.blocks) * 0.75:
+                    if confidence.mean() < self.expand_threshold and not metrics['expanded']:
+                        max_dim = max(self.config.mlp_dim_levels)
+                        for j in range(i + 1, len(self.blocks)):
+                            layer_dims[j] = min(layer_dims[j] * 2, max_dim)
+                        metrics['expanded'] = True
+                        metrics['layer_dims'] = layer_dims.copy()
+        
+        x = norm(x)
+        
+        # LM head
+        softcap = 15
+        logits = self.lm_head(x)
+        logits = logits[..., :self.config.vocab_size]
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
+        
+        if targets is not None:
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                targets.view(-1),
+                ignore_index=-1,
+            )
+            return loss, metrics
+        
+        return logits, metrics
     
     def setup_optimizers(self, **kwargs):
         """Setup optimizers (matching nanochat interface)."""
