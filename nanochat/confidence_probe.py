@@ -64,12 +64,15 @@ class LayerDimPredictor(nn.Module):
             
         Returns:
             List of dims for each layer
+            
+        Uses LAST TOKEN instead of mean pooling to avoid
+        washing out critical instruction signals in long prompts.
         """
-        # Pool over sequence: (B, T, D) → (B, D)
-        pooled = x.mean(dim=1)
+        # Use last token (not mean) to avoid losing signal in long prompts
+        last_token = x[:, -1, :]  # (B, D)
         
         # Predict logits: (B, n_layers * n_levels)
-        logits = self.net(pooled)
+        logits = self.net(last_token)
         logits = logits.view(-1, self.n_layers, self.n_levels)
         
         # Softmax and pick most likely dim per layer
@@ -88,8 +91,8 @@ class LayerDimPredictor(nn.Module):
         Returns:
             expected_dims: (B, n_layers) expected dimension per layer
         """
-        pooled = x.mean(dim=1)
-        logits = self.net(pooled)
+        last_token = x[:, -1, :]  # Use last token
+        logits = self.net(last_token)
         logits = logits.view(-1, self.n_layers, self.n_levels)
         
         probs = F.softmax(logits, dim=-1)  # (B, n_layers, n_levels)
@@ -101,13 +104,7 @@ class LayerDimPredictor(nn.Module):
 
 
 class ConfidenceGate(nn.Module):
-    """
-    Unified gate that controls both:
-    1. Early exit (high confidence → skip remaining layers)
-    2. Dim expansion (low confidence near end → expand)
-    
-    This replaces per-layer probes with a single lightweight gate.
-    """
+    """Gate for early exit decision. High confidence = exit early."""
     
     def __init__(self, d_model: int, probe_dim: int = 64):
         super().__init__()
@@ -122,15 +119,33 @@ class ConfidenceGate(nn.Module):
         """
         Compute confidence score from hidden state.
         
-        Args:
-            x: Hidden state (B, T, D)
-            
-        Returns:
-            confidence: (B,) confidence in [0, 1]
+        Uses LAST TOKEN (not mean) for consistency with LayerDimPredictor.
         """
-        # Pool over sequence
-        pooled = x.mean(dim=1)  # (B, D)
-        return self.net(pooled).squeeze(-1)  # (B,)
+        last_token = x[:, -1, :]  # (B, D)
+        return self.net(last_token).squeeze(-1)  # (B,)
+
+
+class ExpansionGate(nn.Module):
+    """
+    Learnable gate for deciding when to expand dimensions.
+    
+    Replaces hardcoded threshold with learned decision.
+    High output = model needs more capacity.
+    """
+    
+    def __init__(self, d_model: int, probe_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d_model, probe_dim),
+            nn.GELU(),
+            nn.Linear(probe_dim, 1),
+            nn.Sigmoid(),
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns expansion probability in [0, 1]. High = need to expand."""
+        last_token = x[:, -1, :]
+        return self.net(last_token).squeeze(-1)
 
 
 class MatryoshkaKVCache:

@@ -26,6 +26,7 @@ from nanochat.mamba_block import MambaBlock, MambaLayer
 from nanochat.confidence_probe import (
     ConfidenceProbe, LayerProbe, ThinkDetector,  # Legacy V1
     LayerDimPredictor, ConfidenceGate, MatryoshkaKVCache,  # V2
+    ExpansionGate,  # V2 learnable expansion
     AdaptiveController,
 )
 from nanochat.matryoshka import (

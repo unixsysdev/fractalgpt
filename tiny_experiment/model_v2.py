@@ -124,12 +124,15 @@ class LayerDimPredictor(nn.Module):
         """
         x: (B, T, D) - embedded prompt
         Returns: list of dims for each layer
+        
+        Uses LAST TOKEN instead of mean pooling to avoid
+        washing out critical instruction signals in long prompts.
         """
-        # Pool over sequence: (B, T, D) → (B, D)
-        pooled = x.mean(dim=1)
+        # Use last token (not mean) to avoid losing signal in long prompts
+        last_token = x[:, -1, :]  # (B, D)
         
         # Predict logits: (B, n_layers * n_levels)
-        logits = self.net(pooled)
+        logits = self.net(last_token)
         logits = logits.view(-1, self.config.n_layer, len(self.dim_levels))
         
         # Softmax and pick most likely dim per layer
@@ -147,11 +150,7 @@ class LayerDimPredictor(nn.Module):
 # =============================================================================
 
 class ConfidenceGate(nn.Module):
-    """
-    Unified gate that controls:
-    1. Early exit (high confidence → skip remaining layers)
-    2. Dim expansion (low confidence near end → expand)
-    """
+    """Gate for early exit decision. High confidence = exit early."""
     
     def __init__(self, d_model: int):
         super().__init__()
@@ -164,9 +163,30 @@ class ConfidenceGate(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns confidence score in [0, 1]."""
-        # Pool over sequence
-        pooled = x.mean(dim=1)  # (B, D)
-        return self.gate(pooled).squeeze(-1)  # (B,)
+        # Use last token (consistent with LayerDimPredictor)
+        last_token = x[:, -1, :]  # (B, D)
+        return self.gate(last_token).squeeze(-1)  # (B,)
+
+
+class ExpansionGate(nn.Module):
+    """Learnable gate for deciding when to expand dimensions.
+    
+    Replaces hardcoded threshold with learned decision.
+    """
+    
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Linear(d_model, 32),
+            nn.GELU(),
+            nn.Linear(32, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Returns expansion probability in [0, 1]. High = need to expand."""
+        last_token = x[:, -1, :]
+        return self.gate(last_token).squeeze(-1)
 
 
 # =============================================================================
@@ -379,6 +399,7 @@ class NanoFractalV2(nn.Module):
         # Predictors and gates
         self.dim_predictor = LayerDimPredictor(config)
         self.gate = ConfidenceGate(config.n_embd)
+        self.expansion_gate = ExpansionGate(config.n_embd)  # Learnable expansion
         
         # Layers (alternating with/without Mamba)
         self.layers = nn.ModuleList([
@@ -433,13 +454,15 @@ class NanoFractalV2(nn.Module):
                     metrics['exit_layer'] = i + 1
                     break
             
-            # Expansion check (approaching end with low confidence)
-            if i >= self.config.n_layer * 0.75 and confidence.mean() < self.config.expand_threshold:
-                # Double remaining layer dims
-                for j in range(i + 1, self.config.n_layer):
-                    layer_dims[j] = min(layer_dims[j] * 2, self.config.dim_levels[-1])
-                metrics['expanded'] = True
-                metrics['layer_dims'] = layer_dims.copy()
+            # Learnable expansion check (replaces hardcoded threshold)
+            if i >= self.config.n_layer * 0.75 and not metrics['expanded']:
+                expand_prob = self.expansion_gate(x)
+                if expand_prob.mean() > 0.5:  # Learned decision
+                    max_dim = self.config.dim_levels[-1]
+                    for j in range(i + 1, self.config.n_layer):
+                        layer_dims[j] = min(layer_dims[j] * 2, max_dim)
+                    metrics['expanded'] = True
+                    metrics['layer_dims'] = layer_dims.copy()
         
         # Output
         x = self.ln_f(x)

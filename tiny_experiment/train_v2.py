@@ -1,10 +1,11 @@
 """
-Training script for Nano-Fractal V2.
+Training script for Adamba V2.
 
 Trains:
 1. Main task (language modeling)
-2. LayerDimPredictor (learns optimal per-layer dims)
-3. ConfidenceGate (learns when to exit / expand)
+2. LayerDimPredictor (learns optimal per-layer dims using last token)
+3. ConfidenceGate (learns when to exit)
+4. ExpansionGate (learns when to expand dims)
 
 Usage:
     python -m tiny_experiment.train_v2
@@ -20,17 +21,17 @@ from tiny_experiment.data import DifficultyDataset, FixedDifficultyDataset
 
 
 def train_v2(
-    steps: int = 2000,
+    steps: int = 1000,  # Reduced for faster validation
     batch_size: int = 32,
     lr: float = 1e-3,
     gate_loss_weight: float = 0.1,
     device: str = "cpu",
 ):
     """
-    Train Nano-Fractal V2 with gate learning.
+    Train Adamba V2 with gate learning.
     """
     print("=" * 70)
-    print("NANO-FRACTAL V2 TRAINING")
+    print("ADAMBA V2 TRAINING")
     print("=" * 70)
     
     config = FractalConfig()
@@ -82,16 +83,19 @@ def train_v2(
                 exit_logits = model.lm_head(model.ln_f(hidden))
                 exit_loss = F.cross_entropy(exit_logits.view(-1, exit_logits.size(-1)), y.view(-1))
                 
-                # Gate should predict: is exit_loss acceptable?
+                # Confidence gate: high confidence if loss is low
                 confidence = model.gate(hidden)
-                
-                # Target: high confidence if loss is low
-                # Sigmoid maps [-inf, inf] to [0, 1], centered at 0
-                target = torch.sigmoid(2.0 - exit_loss).detach()  # Low loss → high target
-                
+                target = torch.sigmoid(2.0 - exit_loss).detach()
                 gate_loss = gate_loss + F.mse_loss(confidence, target.expand_as(confidence))
+                
+                # Expansion gate: high expansion prob if loss is still high near end
+                if i >= config.n_layer * 0.75:
+                    expand_prob = model.expansion_gate(hidden)
+                    # Target: expand if loss is still high
+                    expand_target = torch.sigmoid(exit_loss - 1.0).detach()
+                    gate_loss = gate_loss + F.mse_loss(expand_prob, expand_target.expand_as(expand_prob))
         
-        gate_loss = gate_loss / (config.n_layer - config.min_layers_before_exit)
+        gate_loss = gate_loss / max(1, config.n_layer - config.min_layers_before_exit)
         
         # Total loss
         total_loss = loss + gate_loss_weight * gate_loss
@@ -209,7 +213,7 @@ def train_v2(
     
     print()
     if all_pass:
-        print("  🎉 NANO-FRACTAL V2 TRAINING SUCCESSFUL!")
+        print("  🎉 ADAMBA V2 TRAINING SUCCESSFUL!")
     else:
         print("  ⚠️  Some checks failed - review above")
     
@@ -227,7 +231,7 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
     
     model, history = train_v2(
-        steps=2000,
+        steps=1000,  # 1000 steps for validation
         batch_size=32,
         lr=1e-3,
         gate_loss_weight=0.1,
