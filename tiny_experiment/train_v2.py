@@ -25,7 +25,8 @@ def train_v2(
     steps: int = 1000,  # Reduced for faster validation
     batch_size: int = 32,
     lr: float = 1e-3,
-    gate_loss_weight: float = 0.1,
+    gate_loss_weight: float = 0.01,  # Lowered from 0.1 to prevent gate collapse
+    warmup_steps: int = 200,  # Train main model first before gates
     device: str = "cpu",
 ):
     """
@@ -109,7 +110,11 @@ def train_v2(
         gate_loss = gate_loss / max(1, config.n_layer - config.min_layers_before_exit)
         
         # Total loss: main + gates + difficulty estimator
-        total_loss = loss + gate_loss_weight * gate_loss + 0.1 * difficulty_loss
+        # Warmup: train main model first, then add auxiliary losses
+        if step < warmup_steps:
+            total_loss = loss  # Main only during warmup
+        else:
+            total_loss = loss + gate_loss_weight * gate_loss + 0.01 * difficulty_loss
         
         # Backward
         optimizer.zero_grad()
