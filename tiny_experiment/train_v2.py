@@ -1,11 +1,12 @@
 """
 Training script for Adamba V2.
 
-Trains:
-1. Main task (language modeling)
-2. LayerDimPredictor (learns optimal per-layer dims using last token)
-3. ConfidenceGate (learns when to exit)
-4. ExpansionGate (learns when to expand dims)
+CAUSALITY-SAFE training:
+1. Model weights: trained with random dims (Matryoshka dropout)
+2. Gates: trained with shadow-loss (learn when to exit/expand)
+
+No predictor leakage - dims are sampled randomly, not predicted.
+Gates learn on the same random dims used for the forward pass.
 
 Usage:
     python -m tiny_experiment.train_v2
@@ -16,7 +17,7 @@ import torch.nn.functional as F
 import time
 from typing import Dict, List
 
-from tiny_experiment.model_v2 import NanoFractalV2, FractalConfig
+from tiny_experiment.model_v2 import Adamba, FractalConfig
 from tiny_experiment.data import DifficultyDataset, FixedDifficultyDataset
 
 
@@ -35,9 +36,13 @@ def train_v2(
     print("=" * 70)
     
     config = FractalConfig()
-    model = NanoFractalV2(config).to(device)
+    model = Adamba(config).to(device)
     dataset = DifficultyDataset(max_len=config.max_seq_len)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    
+    print(f"\nCAUSALITY-SAFE TRAINING:")
+    print(f"  - Random dims during training (no predictor leakage)")
+    print(f"  - Gates trained with shadow-loss")
     
     print(f"\nConfig:")
     print(f"  n_layer: {config.n_layer}")

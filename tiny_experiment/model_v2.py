@@ -375,16 +375,21 @@ class FractalLayer(nn.Module):
 
 
 # =============================================================================
-# Complete Fractal Model
+# Complete Adamba Model
 # =============================================================================
 
-class NanoFractalV2(nn.Module):
+class Adamba(nn.Module):
     """
-    Complete Nano-Fractal V2 with all optimizations.
+    Adamba V2: Adaptive Mamba with elastic compute.
+    
+    CRITICAL: To avoid causality violation:
+    - Training: Uses random/full dims (Matryoshka dropout)
+    - Inference: Uses LayerDimPredictor + gates
     
     Features:
-    - LayerDimPredictor: per-layer dimension control
-    - ConfidenceGate: early exit + dimension expansion
+    - LayerDimPredictor: per-layer dimension control (inference only)
+    - ConfidenceGate: early exit (inference only)
+    - ExpansionGate: learnable dim expansion (inference only)
     - Matryoshka cache: slice-down KV cache
     - Static Mamba: efficient O(1) kernel
     """
@@ -396,10 +401,10 @@ class NanoFractalV2(nn.Module):
         # Embedding
         self.embed = nn.Embedding(config.vocab_size, config.n_embd)
         
-        # Predictors and gates
+        # Predictors and gates (used at INFERENCE only to avoid causality violation)
         self.dim_predictor = LayerDimPredictor(config)
         self.gate = ConfidenceGate(config.n_embd)
-        self.expansion_gate = ExpansionGate(config.n_embd)  # Learnable expansion
+        self.expansion_gate = ExpansionGate(config.n_embd)
         
         # Layers (alternating with/without Mamba)
         self.layers = nn.ModuleList([
@@ -412,21 +417,60 @@ class NanoFractalV2(nn.Module):
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         self.lm_head.weight = self.embed.weight  # Tie weights
     
-    def forward(
+    def _sample_random_dims(self) -> List[int]:
+        """Sample random dims for Matryoshka training (avoids causality violation)."""
+        import random
+        return [random.choice(self.config.dim_levels) for _ in range(self.config.n_layer)]
+    
+    def forward_train(
         self,
         idx: torch.Tensor,
-        targets: Optional[torch.Tensor] = None,
-        use_cache: bool = False,
+        targets: torch.Tensor,
+        use_random_dims: bool = True,
     ) -> Tuple[torch.Tensor, dict]:
         """
-        Forward pass with adaptive depth and width.
+        Training forward pass with NO causality violation.
         
-        Returns: (loss or logits, metrics dict)
+        Uses random dims (Matryoshka dropout) instead of predictor.
+        No early exit during training - all layers run.
         """
         B, T = idx.shape
         x = self.embed(idx)
         
-        # Predict per-layer dimensions (once, upfront)
+        # Use random dims to train model to work at all scales
+        if use_random_dims:
+            layer_dims = self._sample_random_dims()
+        else:
+            layer_dims = [self.config.n_embd] * self.config.n_layer  # Full
+        
+        metrics = {'layer_dims': layer_dims.copy(), 'mode': 'train'}
+        
+        # Forward ALL layers (no early exit during training)
+        for i, layer in enumerate(self.layers):
+            x = layer(x, active_dim=layer_dims[i])
+        
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+        
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return loss, metrics
+    
+    def forward_inference(
+        self,
+        idx: torch.Tensor,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Inference forward pass with adaptive compute.
+        
+        Uses LayerDimPredictor + gates for dynamic behavior.
+        No causality violation: at inference we generate autoregressively,
+        so last token IS the current token.
+        """
+        B, T = idx.shape
+        x = self.embed(idx)
+        
+        # Use predictor (safe at inference - last token is current)
         layer_dims = self.dim_predictor(x)
         
         metrics = {
@@ -434,45 +478,54 @@ class NanoFractalV2(nn.Module):
             'confidences': [],
             'exit_layer': self.config.n_layer,
             'expanded': False,
+            'mode': 'inference',
         }
         
-        # Create per-layer KV caches if needed
         kv_caches = [MatryoshkaKVCache(self.config.n_embd) 
                      for _ in range(self.config.n_layer)] if use_cache else [None] * self.config.n_layer
         
-        # Forward through layers with gate control
         for i, layer in enumerate(self.layers):
             x = layer(x, active_dim=layer_dims[i], kv_cache=kv_caches[i])
             
-            # Check confidence gate
             confidence = self.gate(x)
             metrics['confidences'].append(confidence.mean().item())
             
-            # Early exit check (after minimum layers)
+            # Early exit (inference only)
             if i >= self.config.min_layers_before_exit:
                 if confidence.mean() > self.config.exit_threshold:
                     metrics['exit_layer'] = i + 1
                     break
             
-            # Learnable expansion check (replaces hardcoded threshold)
+            # Expansion (inference only)
             if i >= self.config.n_layer * 0.75 and not metrics['expanded']:
                 expand_prob = self.expansion_gate(x)
-                if expand_prob.mean() > 0.5:  # Learned decision
+                if expand_prob.mean() > 0.5:
                     max_dim = self.config.dim_levels[-1]
                     for j in range(i + 1, self.config.n_layer):
                         layer_dims[j] = min(layer_dims[j] * 2, max_dim)
                     metrics['expanded'] = True
-                    metrics['layer_dims'] = layer_dims.copy()
         
-        # Output
         x = self.ln_f(x)
         logits = self.lm_head(x)
         
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-            return loss, metrics
-        
         return logits, metrics
+    
+    def forward(
+        self,
+        idx: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        use_cache: bool = False,
+    ) -> Tuple[torch.Tensor, dict]:
+        """
+        Unified forward that routes to train or inference mode.
+        
+        - If targets provided → training mode (random dims, no gate)
+        - If no targets → inference mode (predictor + gates)
+        """
+        if targets is not None:
+            return self.forward_train(idx, targets)
+        else:
+            return self.forward_inference(idx, use_cache)
     
     def compute_gate_loss(
         self, 
@@ -499,10 +552,10 @@ class NanoFractalV2(nn.Module):
 # =============================================================================
 
 if __name__ == "__main__":
-    print("Testing Nano-Fractal V2...")
+    print("Testing Adamba V2...")
     
     config = FractalConfig()
-    model = NanoFractalV2(config)
+    model = Adamba(config)
     
     print(f"\nConfig:")
     print(f"  n_layer: {config.n_layer}")
@@ -511,21 +564,28 @@ if __name__ == "__main__":
     print(f"  exit_threshold: {config.exit_threshold}")
     print(f"  Total params: {sum(p.numel() for p in model.parameters()):,}")
     
-    # Test forward
     x = torch.randint(0, 256, (2, 32))
     y = torch.randint(0, 256, (2, 32))
     
-    print("\n1. Testing forward pass...")
-    loss, metrics = model(x, y)
+    print("\n1. Testing TRAINING mode (random dims, no early exit)...")
+    loss, metrics = model.forward_train(x, y)
+    print(f"   Mode: {metrics['mode']}")
     print(f"   Loss: {loss.item():.4f}")
+    print(f"   Layer dims: {metrics['layer_dims']}")
+    
+    print("\n2. Testing INFERENCE mode (predictor + gates)...")
+    logits, metrics = model.forward_inference(x)
+    print(f"   Mode: {metrics['mode']}")
     print(f"   Layer dims: {metrics['layer_dims']}")
     print(f"   Confidences: {[f'{c:.2f}' for c in metrics['confidences']]}")
     print(f"   Exit layer: {metrics['exit_layer']}")
     print(f"   Expanded: {metrics['expanded']}")
     
-    # Test with cache
-    print("\n2. Testing with KV cache...")
-    logits, metrics = model(x[:, :16], use_cache=True)
-    print(f"   Shape: {logits.shape}")
+    print("\n3. Testing unified forward (routes correctly)...")
+    loss, m1 = model(x, y)  # Should use train mode
+    logits, m2 = model(x)   # Should use inference mode
+    print(f"   With targets: mode={m1['mode']}")
+    print(f"   Without targets: mode={m2['mode']}")
     
-    print("\n✓ Nano-Fractal V2 works!")
+    print("\n✓ Adamba V2 works! (Causality-safe)")
+

@@ -537,39 +537,87 @@ class HybridGPT(nn.Module):
         
         return avg_loss, metrics
     
-    def forward_v2(
+    def _sample_random_dims(self) -> List[int]:
+        """Sample random dims for Matryoshka training (avoids causality violation)."""
+        import random
+        return [random.choice(self.config.mlp_dim_levels) for _ in range(len(self.blocks))]
+    
+    def forward_v2_train(
         self,
         idx: torch.Tensor,
-        targets: Optional[torch.Tensor] = None,
+        targets: torch.Tensor,
         kv_cache=None,
-        use_adaptive: bool = True,
     ) -> Tuple[torch.Tensor, Dict]:
         """
-        V2 Forward pass with LayerDimPredictor + ConfidenceGate.
+        V2 Training forward with NO causality violation.
         
-        Features:
-        - Per-layer dimension prediction (upfront, GPU-friendly)
-        - Early exit when confident
-        - Dimension expansion when struggling near end
-        
-        Args:
-            idx: Input token ids (B, T)
-            targets: Target token ids for loss (B, T)
-            kv_cache: Optional KV cache for inference
-            use_adaptive: Enable adaptive early exit / expansion
+        Uses random dims (Matryoshka dropout) instead of predictor.
+        No early exit during training - all layers run.
         """
         B, T = idx.size()
         
-        # Rotary embeddings
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
         
-        # Embedding
         x = self.transformer.wte(idx)
         x = norm(x)
         x0 = x
         
-        # V2: Predict per-layer dimensions upfront
+        # Random dims (no predictor leakage)
+        layer_dims = self._sample_random_dims()
+        
+        metrics = {'layer_dims': layer_dims.copy(), 'mode': 'train'}
+        
+        # Forward ALL layers (no early exit during training)
+        for i, block in enumerate(self.blocks):
+            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+            
+            ve = None
+            if block.is_attention and str(i) in self.value_embeds:
+                ve = self.value_embeds[str(i)](idx)
+            
+            x, _ = block(
+                x, ve, cos_sin, self.window_sizes[i], kv_cache,
+                active_dim=layer_dims[i],
+            )
+        
+        x = norm(x)
+        
+        softcap = 15
+        logits = self.lm_head(x)
+        logits = logits[..., :self.config.vocab_size]
+        logits = logits.float()
+        logits = softcap * torch.tanh(logits / softcap)
+        
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            ignore_index=-1,
+        )
+        return loss, metrics
+    
+    def forward_v2_inference(
+        self,
+        idx: torch.Tensor,
+        kv_cache=None,
+    ) -> Tuple[torch.Tensor, Dict]:
+        """
+        V2 Inference forward with adaptive compute.
+        
+        Uses LayerDimPredictor + gates for dynamic behavior.
+        No causality violation: at inference we generate autoregressively,
+        so last token IS the current token.
+        """
+        B, T = idx.size()
+        
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+        
+        x = self.transformer.wte(idx)
+        x = norm(x)
+        x0 = x
+        
+        # Use predictor (safe at inference - last token is current)
         layer_dims = self.dim_predictor(x)
         
         metrics = {
@@ -577,61 +625,65 @@ class HybridGPT(nn.Module):
             'confidences': [],
             'exit_layer': len(self.blocks),
             'expanded': False,
+            'mode': 'inference',
         }
         
-        # Forward through blocks with gate control
         for i, block in enumerate(self.blocks):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             
-            # Get value embedding if attention block
             ve = None
             if block.is_attention and str(i) in self.value_embeds:
                 ve = self.value_embeds[str(i)](idx)
             
-            # Forward block with predicted dimension
             x, _ = block(
                 x, ve, cos_sin, self.window_sizes[i], kv_cache,
                 active_dim=layer_dims[i],
             )
             
-            # V2: Check confidence gate
-            if use_adaptive:
-                confidence = self.confidence_gate(x)
-                metrics['confidences'].append(confidence.mean().item())
-                
-                # Early exit check
-                if i >= self.min_layers_before_exit:
-                    if confidence.mean() > self.exit_threshold:
-                        metrics['exit_layer'] = i + 1
-                        break
-                
-                # Expansion check (near end with low confidence)
-                if i >= len(self.blocks) * 0.75:
-                    if confidence.mean() < self.expand_threshold and not metrics['expanded']:
-                        max_dim = max(self.config.mlp_dim_levels)
-                        for j in range(i + 1, len(self.blocks)):
-                            layer_dims[j] = min(layer_dims[j] * 2, max_dim)
-                        metrics['expanded'] = True
-                        metrics['layer_dims'] = layer_dims.copy()
+            confidence = self.confidence_gate(x)
+            metrics['confidences'].append(confidence.mean().item())
+            
+            # Early exit (inference only)
+            if i >= self.min_layers_before_exit:
+                if confidence.mean() > self.exit_threshold:
+                    metrics['exit_layer'] = i + 1
+                    break
+            
+            # Expansion (inference only)
+            if i >= len(self.blocks) * 0.75 and not metrics['expanded']:
+                expand_prob = self.confidence_gate(x)  # Reuse confidence for now
+                if expand_prob.mean() < self.expand_threshold:
+                    max_dim = max(self.config.mlp_dim_levels)
+                    for j in range(i + 1, len(self.blocks)):
+                        layer_dims[j] = min(layer_dims[j] * 2, max_dim)
+                    metrics['expanded'] = True
         
         x = norm(x)
         
-        # LM head
         softcap = 15
         logits = self.lm_head(x)
         logits = logits[..., :self.config.vocab_size]
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
         
-        if targets is not None:
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1,
-            )
-            return loss, metrics
-        
         return logits, metrics
+    
+    def forward_v2(
+        self,
+        idx: torch.Tensor,
+        targets: Optional[torch.Tensor] = None,
+        kv_cache=None,
+    ) -> Tuple[torch.Tensor, Dict]:
+        """
+        Unified V2 forward that routes to train or inference mode.
+        
+        - If targets provided → training mode (random dims, no gate)
+        - If no targets → inference mode (predictor + gates)
+        """
+        if targets is not None:
+            return self.forward_v2_train(idx, targets, kv_cache)
+        else:
+            return self.forward_v2_inference(idx, kv_cache)
     
     def setup_optimizers(self, **kwargs):
         """Setup optimizers (matching nanochat interface)."""
