@@ -20,12 +20,16 @@ MLP_DIM_LEVELS = [128, 256, 512, 1024, 2048, 4096]
 KV_DIM_LEVELS = [32, 64, 128, 256]
 
 
-class LayerDimPredictor(nn.Module):
+class DifficultyEstimator(nn.Module):
     """
-    Predicts per-layer dimensions from prompt embedding.
+    Estimates input difficulty and maps to dimensions.
     
-    Runs ONCE at the start, outputs dims for all layers.
-    This is GPU-friendly: no graph breaks, shapes known upfront.
+    IMPORTANT: Uses REGRESSION (not classification) to remain differentiable.
+    - Outputs: difficulty_score in [0, 1]
+    - Training: MSE(difficulty_score, actual_loss)
+    - Inference: Maps difficulty → dims via lookup table
+    
+    This is trainable because we don't use argmax!
     """
     
     def __init__(
@@ -40,67 +44,49 @@ class LayerDimPredictor(nn.Module):
         self.dim_levels = dim_levels or MLP_DIM_LEVELS
         self.n_levels = len(self.dim_levels)
         
-        # Small MLP: d_model → n_layers * n_levels
+        # Outputs per-layer difficulty scores via regression
         self.net = nn.Sequential(
             nn.Linear(d_model, probe_dim),
             nn.GELU(),
             nn.Linear(probe_dim, probe_dim),
             nn.GELU(),
-            nn.Linear(probe_dim, n_layers * self.n_levels),
-        )
-        
-        # Register dim_levels as buffer
-        self.register_buffer(
-            'dim_tensor', 
-            torch.tensor(self.dim_levels, dtype=torch.long)
+            nn.Linear(probe_dim, n_layers),  # One score per layer
+            nn.Sigmoid(),  # Outputs in [0, 1]
         )
     
-    def forward(self, x: torch.Tensor) -> List[int]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Predict dimensions for all layers.
+        Predict per-layer difficulty scores.
         
         Args:
             x: Embedded prompt (B, T, D)
             
         Returns:
-            List of dims for each layer
-            
-        Uses LAST TOKEN instead of mean pooling to avoid
-        washing out critical instruction signals in long prompts.
+            difficulty: (B, n_layers) scores in [0, 1]
         """
-        # Use last token (not mean) to avoid losing signal in long prompts
         last_token = x[:, -1, :]  # (B, D)
+        return self.net(last_token)  # (B, n_layers)
+    
+    def difficulty_to_dims(self, difficulty: torch.Tensor) -> List[int]:
+        """Map difficulty scores to dimension levels. Higher difficulty → higher dims."""
+        scores = difficulty[0]  # (n_layers,)
         
-        # Predict logits: (B, n_layers * n_levels)
-        logits = self.net(last_token)
-        logits = logits.view(-1, self.n_layers, self.n_levels)
-        
-        # Softmax and pick most likely dim per layer
-        probs = F.softmax(logits, dim=-1)
-        indices = probs.argmax(dim=-1)  # (B, n_layers)
-        
-        # Convert to dim values (use first batch item for consistency)
-        dims = [self.dim_levels[idx.item()] for idx in indices[0]]
+        dims = []
+        for score in scores:
+            idx = int(score.item() * (self.n_levels - 1) + 0.5)
+            idx = max(0, min(self.n_levels - 1, idx))
+            dims.append(self.dim_levels[idx])
         
         return dims
     
-    def forward_soft(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Get soft (differentiable) dimension predictions for training.
-        
-        Returns:
-            expected_dims: (B, n_layers) expected dimension per layer
-        """
-        last_token = x[:, -1, :]  # Use last token
-        logits = self.net(last_token)
-        logits = logits.view(-1, self.n_layers, self.n_levels)
-        
-        probs = F.softmax(logits, dim=-1)  # (B, n_layers, n_levels)
-        dim_values = self.dim_tensor.float()  # (n_levels,)
-        
-        # Expected dim = weighted sum
-        expected = (probs * dim_values).sum(dim=-1)  # (B, n_layers)
-        return expected
+    def get_dims(self, x: torch.Tensor) -> List[int]:
+        """Convenience: predict difficulty and map to dims."""
+        difficulty = self.forward(x)
+        return self.difficulty_to_dims(difficulty)
+
+
+# Legacy alias for compatibility
+LayerDimPredictor = DifficultyEstimator
 
 
 class ConfidenceGate(nn.Module):

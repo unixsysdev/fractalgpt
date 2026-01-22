@@ -70,21 +70,30 @@ def train_v2(
         x, y, difficulties = dataset.generate_batch(batch_size)
         x, y = x.to(device), y.to(device)
         
-        # Forward with metrics
+        # Forward with random dims (causality-safe)
         loss, metrics = model(x, y)
         
-        # Gate training: teach gate when exit is safe
+        # === Train DifficultyEstimator via MSE ===
+        # The estimator predicts difficulty, which should match the actual loss
+        hidden = model.embed(x)
+        difficulty_pred = model.dim_predictor(hidden)  # (B, n_layers), values in [0,1]
+        
+        # Target: normalized loss (clamped to [0, 1])
+        difficulty_target = torch.sigmoid(loss.detach() - 1.0)  # Higher loss → higher difficulty
+        difficulty_target = difficulty_target.expand_as(difficulty_pred)
+        
+        difficulty_loss = F.mse_loss(difficulty_pred, difficulty_target)
+        
+        # === Train Gates via shadow loss ===
         gate_loss = torch.tensor(0.0, device=device)
         
-        # Compute what loss would be at each layer
-        hidden = model.embed(x)
-        layer_dims = model.dim_predictor(hidden)
+        # Use RANDOM dims (same as forward_train) to avoid tainted gate training
+        layer_dims = model._sample_random_dims()
         
         for i, layer in enumerate(model.layers):
             hidden = layer(hidden, active_dim=layer_dims[i])
             
             if i >= config.min_layers_before_exit:
-                # What's the loss if we exit here?
                 exit_logits = model.lm_head(model.ln_f(hidden))
                 exit_loss = F.cross_entropy(exit_logits.view(-1, exit_logits.size(-1)), y.view(-1))
                 
@@ -93,17 +102,16 @@ def train_v2(
                 target = torch.sigmoid(2.0 - exit_loss).detach()
                 gate_loss = gate_loss + F.mse_loss(confidence, target.expand_as(confidence))
                 
-                # Expansion gate: high expansion prob if loss is still high near end
+                # Expansion gate: high prob if loss is still high near end
                 if i >= config.n_layer * 0.75:
                     expand_prob = model.expansion_gate(hidden)
-                    # Target: expand if loss is still high
                     expand_target = torch.sigmoid(exit_loss - 1.0).detach()
                     gate_loss = gate_loss + F.mse_loss(expand_prob, expand_target.expand_as(expand_prob))
         
         gate_loss = gate_loss / max(1, config.n_layer - config.min_layers_before_exit)
         
-        # Total loss
-        total_loss = loss + gate_loss_weight * gate_loss
+        # Total loss: main + gates + difficulty estimator
+        total_loss = loss + gate_loss_weight * gate_loss + 0.1 * difficulty_loss
         
         # Backward
         optimizer.zero_grad()

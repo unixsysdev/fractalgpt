@@ -99,50 +99,77 @@ class MatryoshkaKVCache:
 
 
 # =============================================================================
-# Layer Dimension Predictor
+# Difficulty Estimator (Trainable via Regression)
 # =============================================================================
 
-class LayerDimPredictor(nn.Module):
+class DifficultyEstimator(nn.Module):
     """
-    Predicts per-layer dimensions from prompt embedding.
-    Runs ONCE at the start, outputs dims for all layers.
+    Estimates input difficulty and maps to dimensions.
+    
+    IMPORTANT: Uses REGRESSION (not classification) to remain differentiable.
+    - Outputs: difficulty_score in [0, 1]
+    - Training: MSE(difficulty_score, actual_loss)
+    - Inference: Maps difficulty → dims via lookup table
+    
+    This is trainable because we don't use argmax!
     """
     
     def __init__(self, config: FractalConfig):
         super().__init__()
         self.config = config
         self.dim_levels = config.dim_levels
+        self.n_layers = config.n_layer
         
-        # Small MLP: d_model → n_layers outputs
+        # Outputs per-layer difficulty scores
         self.net = nn.Sequential(
             nn.Linear(config.n_embd, 64),
             nn.GELU(),
-            nn.Linear(64, config.n_layer * len(config.dim_levels)),
+            nn.Linear(64, 64),
+            nn.GELU(),
+            nn.Linear(64, config.n_layer),  # One score per layer
+            nn.Sigmoid(),  # Outputs in [0, 1]
         )
     
-    def forward(self, x: torch.Tensor) -> List[int]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: (B, T, D) - embedded prompt
-        Returns: list of dims for each layer
+        Predict per-layer difficulty scores.
         
-        Uses LAST TOKEN instead of mean pooling to avoid
-        washing out critical instruction signals in long prompts.
+        Args:
+            x: Embedded prompt (B, T, D)
+            
+        Returns:
+            difficulty: (B, n_layers) scores in [0, 1]
         """
-        # Use last token (not mean) to avoid losing signal in long prompts
         last_token = x[:, -1, :]  # (B, D)
+        return self.net(last_token)  # (B, n_layers)
+    
+    def difficulty_to_dims(self, difficulty: torch.Tensor) -> List[int]:
+        """
+        Map difficulty scores to dimension levels.
         
-        # Predict logits: (B, n_layers * n_levels)
-        logits = self.net(last_token)
-        logits = logits.view(-1, self.config.n_layer, len(self.dim_levels))
+        Higher difficulty → higher dims
+        """
+        # Use first batch item
+        scores = difficulty[0]  # (n_layers,)
         
-        # Softmax and pick most likely dim per layer
-        probs = F.softmax(logits, dim=-1)
-        indices = probs.argmax(dim=-1)  # (B, n_layers)
-        
-        # Convert to dim values (use first batch item)
-        dims = [self.dim_levels[idx.item()] for idx in indices[0]]
+        dims = []
+        n_levels = len(self.dim_levels)
+        for score in scores:
+            # Map [0, 1] → [0, n_levels-1]
+            idx = int(score.item() * (n_levels - 1) + 0.5)  # Round to nearest
+            idx = max(0, min(n_levels - 1, idx))  # Clamp
+            dims.append(self.dim_levels[idx])
         
         return dims
+    
+    def get_dims(self, x: torch.Tensor) -> List[int]:
+        """Convenience: predict difficulty and map to dims."""
+        difficulty = self.forward(x)
+        return self.difficulty_to_dims(difficulty)
+
+
+# Legacy alias for compatibility
+LayerDimPredictor = DifficultyEstimator
 
 
 # =============================================================================
@@ -471,10 +498,10 @@ class Adamba(nn.Module):
         x = self.embed(idx)
         
         # Use predictor (safe at inference - last token is current)
-        layer_dims = self.dim_predictor(x)
+        layer_dims = self.dim_predictor.get_dims(x)
         
         metrics = {
-            'layer_dims': layer_dims.copy(),
+            'layer_dims': list(layer_dims),  # Copy list
             'confidences': [],
             'exit_layer': self.config.n_layer,
             'expanded': False,
