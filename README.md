@@ -117,4 +117,44 @@ python -m scripts.surgery --expand-from=2048 --new-dim=2560
 
 ---
 
+## TODO Before Real Training
+
+### 1. Stage-Dependent Freeze/Unfreeze
+
+**Stage 1 (Train Mamba):**
+- Freeze: All attention layers (even blocks)
+- Train: Mamba layers (odd blocks) + Gates + DifficultyEstimator
+- Why: Saves 50% optimizer VRAM → bigger batch → more tokens per $
+
+**Stage 2+ (Expansion):**
+- Freeze: Original dims (first 2048)
+- Train: NEW expanded dims only + Mamba
+- Later: Unfreeze all with lower LR for fine-tuning
+
+**Implementation:** Add `--stage` flag to `scripts/fractal_train.py`:
+```python
+if args.stage == 1:
+    freeze_even_blocks()  # Attention
+    train_odd_blocks()    # Mamba
+elif args.stage == 2:
+    freeze_first_n_dims(2048)
+    train_expanded_dims()
+```
+
+### 2. Smarter Expansion Initialization
+
+**Current (Stage 1):** Mamba uses `zero-init` ✓ (correct, nothing to copy)
+
+**For Stage 2/3 Expansion:** Don't just use zeros. Options:
+
+| Method | Description | Quality |
+|--------|-------------|---------|
+| **LoRA-style** | `new = A @ B` (low-rank, small init) | ⭐⭐⭐ |
+| Copy+Scale | Copy first 512 dims, scale by 0.1 | ⭐⭐ |
+| SVD Extension | Extrapolate singular values | ⭐⭐⭐ |
+
+**Recommended:** LoRA-style for expanded dims (retains structure, gradients flow well)
+
+---
+
 *Based on [nanochat](https://github.com/karpathy/nanochat) by Andrej Karpathy*
