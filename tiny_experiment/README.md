@@ -1,6 +1,6 @@
-# Tiny Fractal Experiment V2
+# Adamba Tiny Experiment
 
-Self-contained architecture validation for **Nano-Fractal V2** — the complete emergent intelligence architecture.
+Self-contained architecture validation for **Adamba V2** — the elastic compute model.
 
 ## 🎉 Results: All Systems Working!
 
