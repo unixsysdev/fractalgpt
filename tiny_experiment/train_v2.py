@@ -70,43 +70,41 @@ def train_v2(
         x, y, difficulties = dataset.generate_batch(batch_size)
         x, y = x.to(device), y.to(device)
         
-        # Forward with random dims (causality-safe)
-        loss, metrics = model(x, y)
+        # === SINGLE FORWARD PASS (optimized) ===
+        # Get loss + hidden states for gate training
+        loss, metrics = model.forward_train(x, y, return_hidden_states=True)
+        hidden_states = metrics['hidden_states']
+        layer_dims = metrics['layer_dims']
         
         # === Train DifficultyEstimator via MSE ===
-        # The estimator predicts difficulty, which should match the actual loss
-        hidden = model.embed(x)
-        difficulty_pred = model.dim_predictor(hidden)  # (B, n_layers), values in [0,1]
+        embedded = model.embed(x)
+        difficulty_pred = model.dim_predictor(embedded)  # (B, n_layers), values in [0,1]
         
         # Target: normalized loss (clamped to [0, 1])
-        difficulty_target = torch.sigmoid(loss.detach() - 1.0)  # Higher loss → higher difficulty
+        difficulty_target = torch.sigmoid(loss.detach() - 1.0)
         difficulty_target = difficulty_target.expand_as(difficulty_pred)
         
         difficulty_loss = F.mse_loss(difficulty_pred, difficulty_target)
         
-        # === Train Gates via shadow loss ===
+        # === Train Gates via shadow loss (using hidden states from forward) ===
         gate_loss = torch.tensor(0.0, device=device)
         
-        # Use RANDOM dims (same as forward_train) to avoid tainted gate training
-        layer_dims = model._sample_random_dims()
-        
-        for i, layer in enumerate(model.layers):
-            hidden = layer(hidden, active_dim=layer_dims[i])
+        for i in range(config.min_layers_before_exit, config.n_layer):
+            hidden = hidden_states[i]
             
-            if i >= config.min_layers_before_exit:
-                exit_logits = model.lm_head(model.ln_f(hidden))
-                exit_loss = F.cross_entropy(exit_logits.view(-1, exit_logits.size(-1)), y.view(-1))
-                
-                # Confidence gate: high confidence if loss is low
-                confidence = model.gate(hidden)
-                target = torch.sigmoid(2.0 - exit_loss).detach()
-                gate_loss = gate_loss + F.mse_loss(confidence, target.expand_as(confidence))
-                
-                # Expansion gate: high prob if loss is still high near end
-                if i >= config.n_layer * 0.75:
-                    expand_prob = model.expansion_gate(hidden)
-                    expand_target = torch.sigmoid(exit_loss - 1.0).detach()
-                    gate_loss = gate_loss + F.mse_loss(expand_prob, expand_target.expand_as(expand_prob))
+            exit_logits = model.lm_head(model.ln_f(hidden))
+            exit_loss = F.cross_entropy(exit_logits.view(-1, exit_logits.size(-1)), y.view(-1))
+            
+            # Confidence gate: high confidence if loss is low
+            confidence = model.gate(hidden)
+            target = torch.sigmoid(2.0 - exit_loss).detach()
+            gate_loss = gate_loss + F.mse_loss(confidence, target.expand_as(confidence))
+            
+            # Expansion gate: high prob if loss is still high near end
+            if i >= config.n_layer * 0.75:
+                expand_prob = model.expansion_gate(hidden)
+                expand_target = torch.sigmoid(exit_loss - 1.0).detach()
+                gate_loss = gate_loss + F.mse_loss(expand_prob, expand_target.expand_as(expand_prob))
         
         gate_loss = gate_loss / max(1, config.n_layer - config.min_layers_before_exit)
         
@@ -156,7 +154,8 @@ def train_v2(
                 x, y, _ = fixed_dataset.generate_batch(8)
                 x, y = x.to(device), y.to(device)
                 
-                _, metrics = model(x, y)
+                # Use INFERENCE mode for validation (has exit_layer, expanded metrics)
+                _, metrics = model.forward_inference(x)
                 exit_layers.append(metrics['exit_layer'])
                 dims_used.append(sum(metrics['layer_dims']) / len(metrics['layer_dims']))
                 expansions += 1 if metrics['expanded'] else 0
@@ -173,7 +172,8 @@ def train_v2(
         x, y, _ = dataset.generate_batch(16)
         x, y = x.to(device), y.to(device)
         
-        _, metrics = model(x, y)
+        # Use inference mode  
+        _, metrics = model.forward_inference(x)
         
         print(f"   Layer dims: {metrics['layer_dims']}")
         print(f"   Confidences: {[f'{c:.3f}' for c in metrics['confidences']]}")

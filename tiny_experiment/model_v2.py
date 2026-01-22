@@ -454,12 +454,17 @@ class Adamba(nn.Module):
         idx: torch.Tensor,
         targets: torch.Tensor,
         use_random_dims: bool = True,
+        return_hidden_states: bool = False,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Training forward pass with NO causality violation.
         
         Uses random dims (Matryoshka dropout) instead of predictor.
         No early exit during training - all layers run.
+        
+        Args:
+            return_hidden_states: If True, return hidden state at each layer
+                                  for efficient gate training (avoids double forward)
         """
         B, T = idx.shape
         x = self.embed(idx)
@@ -470,16 +475,26 @@ class Adamba(nn.Module):
         else:
             layer_dims = [self.config.n_embd] * self.config.n_layer  # Full
         
-        metrics = {'layer_dims': layer_dims.copy(), 'mode': 'train'}
+        metrics = {'layer_dims': list(layer_dims), 'mode': 'train'}
+        
+        # Collect hidden states if requested (for gate training)
+        hidden_states = [] if return_hidden_states else None
         
         # Forward ALL layers (no early exit during training)
         for i, layer in enumerate(self.layers):
             x = layer(x, active_dim=layer_dims[i])
+            if return_hidden_states:
+                hidden_states.append(x)
         
         x = self.ln_f(x)
         logits = self.lm_head(x)
         
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        
+        if return_hidden_states:
+            metrics['hidden_states'] = hidden_states
+            metrics['layer_dims'] = layer_dims  # Keep mutable for gate training
+        
         return loss, metrics
     
     def forward_inference(
