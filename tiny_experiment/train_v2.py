@@ -113,8 +113,9 @@ def train_v2(
         # Track
         history['loss'].append(loss.item())
         history['gate_loss'].append(gate_loss.item())
-        history['exit_layers'].append(metrics['exit_layer'])
-        history['expansions'].append(1 if metrics['expanded'] else 0)
+        # Note: train mode doesn't have exit/expansion (no early exit during training)
+        history['exit_layers'].append(metrics.get('exit_layer', config.n_layer))
+        history['expansions'].append(1 if metrics.get('expanded', False) else 0)
         history['avg_dim'].append(sum(metrics['layer_dims']) / len(metrics['layer_dims']))
         
         # Log
