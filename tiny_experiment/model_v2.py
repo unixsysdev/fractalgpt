@@ -33,7 +33,7 @@ class FractalConfig:
     dim_levels: List[int] = field(default_factory=lambda: [32, 64, 128, 256])
     
     # Gate thresholds
-    exit_threshold: float = 0.95
+    exit_threshold: float = 0.80  # Lowered from 0.95 for achievable exits
     expand_threshold: float = 0.5
     min_layers_before_exit: int = 4
     
