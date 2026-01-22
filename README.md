@@ -155,6 +155,29 @@ elif args.stage == 2:
 
 **Recommended:** LoRA-style for expanded dims (retains structure, gradients flow well)
 
+### 3. ⚠️ CRITICAL: Attention Weight Interleaving
+
+**Problem:** MHA weights are stored as `[Head1 | Head2 | ... | Head16]`. 
+
+If you naively `torch.cat` at the end to expand:
+```
+[Head1_128 | Head2_128 | ... | Head16_128 | NEW_512_AT_END]  ← WRONG!
+```
+
+Then `q.view(B, T, n_head, new_head_dim)` will grab wrong data per head = **scrambled intelligence**.
+
+**Required:** Interleaved expansion per head:
+```
+[Head1_128+32 | Head2_128+32 | ... | Head16_128+32]  ← CORRECT
+```
+
+**`surgery.py` needs special logic for attention weights:**
+- Reshape to `(n_head, head_dim, input_dim)`
+- Expand each head's dims separately
+- Flatten back to 2D
+
+This does NOT affect Stage 1 (Mamba is new, not expanded). Critical for Stage 2+.
+
 ---
 
 *Based on [nanochat](https://github.com/karpathy/nanochat) by Andrej Karpathy*
