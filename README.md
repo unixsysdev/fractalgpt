@@ -1,16 +1,45 @@
-# Nano-Fractal
+# Nano-Fractal V2
 
 > Emergent Fractal Intelligence: Hybrid Mamba-Transformer with dynamic Matryoshka scaling.
 
 **Fork of [karpathy/nanochat](https://github.com/karpathy/nanochat)**
 
+## V2 Architecture ✨
+
+**NEW** - GPU-friendly adaptive compute:
+- 🎯 **LayerDimPredictor**: Predicts per-layer dims upfront (no graph breaks)
+- 🚪 **ConfidenceGate**: Early exit (71% savings) + dim expansion
+- 📦 **MatryoshkaKVCache**: Slice-down cache strategy
+- 🧠 **Static Mamba**: Uses efficient CUDA kernel (no padding)
+
+```
+┌─────────────────────────────────────────────────┐
+│  PROMPT → LayerDimPredictor → [dim per layer]   │
+└─────────────────────────────────────────────────┘
+                        ↓
+┌─────────────────────────────────────────────────┐
+│  Layer 0:  Attention(256) + MLP(256)           │
+│            Gate: 0.48                           │
+│  Layer 16: Gate > 0.95 → EXIT EARLY ✓           │
+│       OR   Gate < 0.5  → EXPAND remaining       │
+└─────────────────────────────────────────────────┘
+```
+
 ## What's New
 
 - 🧬 **Hybrid Architecture**: 32 Attention + 32 Mamba layers (64 total)
 - 📐 **Matryoshka Dimensions**: Ghost (128) → God (4096) dynamic scaling
-- 🧠 **Neural Confidence Probes**: Per-layer capacity allocation
+- 🧠 **V2 Confidence Gate**: Unified early exit + expansion (replaces per-layer probes)
 - ⚡ **Energy Penalty Loss**: "Lazy but correct" compute minimization
 - 🪆 **Progressive Training**: 6B → 9B → 20B staged expansion
+
+## Validated in tiny_experiment
+
+```
+Early exits: 71.5%  (37.5% compute saved!)
+Gate loss:   0.28 → 0.03  (learned when to exit)
+Hard tasks get more dims than easy tasks ✓
+```
 
 ## Architecture
 
@@ -58,12 +87,13 @@ python -m scripts.surgery --expand-from=2048 --new-dim=2560
 
 | File | Purpose |
 |------|---------|
-| `nanochat/hybrid_gpt.py` | HybridGPT (Mamba+Attention) |
-| `nanochat/mamba_block.py` | Mamba with SSM fallback |
+| `nanochat/hybrid_gpt.py` | HybridGPT V2 (Mamba+Attention+Gate) |
+| `nanochat/mamba_block.py` | Static Mamba with SSM fallback |
 | `nanochat/matryoshka.py` | Dimension slicing + energy loss |
-| `nanochat/confidence_probe.py` | Neural probes |
+| `nanochat/confidence_probe.py` | V2: LayerDimPredictor, ConfidenceGate |
 | `scripts/surgery.py` | Create/expand hybrid checkpoints |
 | `scripts/fractal_train.py` | Matryoshka training |
+| `tiny_experiment/` | Local validation suite |
 
 ## Matryoshka Levels
 
