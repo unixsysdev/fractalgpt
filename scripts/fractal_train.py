@@ -30,6 +30,10 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+# Fix TF32 setting conflict (CUDA 12.9 issue)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 from nanochat.common import (
     compute_init, get_dist_info, print0, print_banner,
     get_peak_flops, ColoredFormatter,
