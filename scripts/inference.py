@@ -117,8 +117,9 @@ def generate(
     device: str = "cuda",
 ):
     """Generate text from prompt."""
-    # Encode prompt
-    tokens = tokenizer.encode(prompt, bos=True, eos=False)
+    # Encode prompt (use prepend for BOS token)
+    bos_id = tokenizer.get_bos_token_id()
+    tokens = tokenizer.encode(prompt, prepend=bos_id)
     tokens = torch.tensor([tokens], dtype=torch.long, device=device)
     
     print(f"📝 Prompt: {prompt}")
@@ -159,8 +160,8 @@ def generate(
         token_str = tokenizer.decode([next_token.item()])
         print(token_str, end="", flush=True)
         
-        # Stop on EOS
-        if next_token.item() == tokenizer.eos_id:
+        # Stop on BOS (used as document delimiter in nanochat)
+        if next_token.item() == tokenizer.get_bos_token_id():
             break
     
     print()
