@@ -54,7 +54,6 @@ class DistAdamW(torch.optim.Optimizer):
                 assert isinstance(group['params'], list), "expecting group['params'] to be a list of tensors"
                 for p in group['params']:
                     sliced = p.numel() >= 1024
-                    print(f"AdamW: 1 param of shape {p.shape}, sliced={sliced}")
                     if sliced: # large parameter tensors will be operated on in slices
                         assert p.shape[0] % world_size == 0, f"First dim of parameter shape {p.shape} must be divisible by world size {world_size}"
         super().__init__(param_groups, defaults)
