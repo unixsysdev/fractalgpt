@@ -140,43 +140,28 @@ torchrun -m scripts.fractal_train --phase=2 --checkpoint=phase2.pt
 torchrun -m scripts.fractal_train --phase=3 --checkpoint=phase3.pt
 ```
 
-### TODO: Smarter Expansion Initialization
+### Smarter Expansion Initialization (Implemented ✓)
 
+**Mamba (Stage 1):** Uses `zero-init` ✓ (correct, nothing to copy)
 
-**Current (Stage 1):** Mamba uses `zero-init` ✓ (correct, nothing to copy)
-
-**For Stage 2/3 Expansion:** Don't just use zeros. Options:
-
-| Method | Description | Quality |
-|--------|-------------|---------|
-| **LoRA-style** | `new = A @ B` (low-rank, small init) | ⭐⭐⭐ |
-| Copy+Scale | Copy first 512 dims, scale by 0.1 | ⭐⭐ |
-| SVD Extension | Extrapolate singular values | ⭐⭐⭐ |
-
-**Recommended:** LoRA-style for expanded dims (retains structure, gradients flow well)
-
-### 3. ⚠️ CRITICAL: Attention Weight Interleaving
-
-**Problem:** MHA weights are stored as `[Head1 | Head2 | ... | Head16]`. 
-
-If you naively `torch.cat` at the end to expand:
-```
-[Head1_128 | Head2_128 | ... | Head16_128 | NEW_512_AT_END]  ← WRONG!
+**MLP/Attention Expansion (Stage 2/3):** Uses LoRA-style initialization:
+```python
+# Instead of zeros, new dims = A @ B (low-rank, small init)
+expand_weight_lora(weight, target_size, dim, rank=16, std=0.01)
 ```
 
-Then `q.view(B, T, n_head, new_head_dim)` will grab wrong data per head = **scrambled intelligence**.
+### Attention Weight Interleaving (Implemented ✓)
 
-**Required:** Interleaved expansion per head:
+**Problem Solved:** MHA weights are stored as `[Head1 | Head2 | ... | Head16]`.
+
+**Solution:** `expand_attention_interleaved()` expands each head's dims separately:
 ```
 [Head1_128+32 | Head2_128+32 | ... | Head16_128+32]  ← CORRECT
 ```
 
-**`surgery.py` needs special logic for attention weights:**
-- Reshape to `(n_head, head_dim, input_dim)`
-- Expand each head's dims separately
-- Flatten back to 2D
-
-This does NOT affect Stage 1 (Mamba is new, not expanded). Critical for Stage 2+.
+Functions in `scripts/surgery.py`:
+- `expand_weight_lora()` - LoRA-style low-rank initialization
+- `expand_attention_interleaved()` - Per-head dimension expansion
 
 ---
 

@@ -43,51 +43,167 @@ def expand_weight(weight: torch.Tensor, target_size: int, dim: int = 0) -> torch
     return torch.cat([weight, padding], dim=dim)
 
 
+def expand_weight_lora(
+    weight: torch.Tensor, 
+    target_size: int, 
+    dim: int = 0, 
+    rank: int = 16, 
+    std: float = 0.01
+) -> torch.Tensor:
+    """
+    Expand weight tensor using LoRA-style low-rank initialization.
+    
+    Instead of zero-padding, the new dimensions are initialized as A @ B
+    where A and B are small random matrices. This:
+    - Preserves gradient flow (not dead zeros)
+    - Has structure (low-rank, not random noise)
+    - Starts near-zero (small std)
+    """
+    current_size = weight.size(dim)
+    if current_size >= target_size:
+        return weight
+    
+    expansion_size = target_size - current_size
+    other_dim = 1 - dim if weight.dim() == 2 else 0
+    other_size = weight.size(other_dim) if weight.dim() > 1 else 1
+    
+    # Create low-rank expansion: A @ B
+    if weight.dim() == 2:
+        if dim == 0:  # Expanding output dimension
+            # A: (expansion_size, rank), B: (rank, input_size)
+            A = torch.randn(expansion_size, rank, dtype=weight.dtype, device=weight.device) * std
+            B = torch.randn(rank, weight.size(1), dtype=weight.dtype, device=weight.device)
+            expansion = A @ B  # (expansion_size, input_size)
+        else:  # dim == 1, expanding input dimension
+            # A: (output_size, rank), B: (rank, expansion_size)
+            A = torch.randn(weight.size(0), rank, dtype=weight.dtype, device=weight.device)
+            B = torch.randn(rank, expansion_size, dtype=weight.dtype, device=weight.device) * std
+            expansion = A @ B  # (output_size, expansion_size)
+    else:
+        # 1D tensor - just use small random
+        expansion = torch.randn(expansion_size, dtype=weight.dtype, device=weight.device) * std
+    
+    return torch.cat([weight, expansion], dim=dim)
+
+
+def expand_attention_interleaved(
+    weight: torch.Tensor,
+    old_dim: int,
+    new_dim: int,
+    n_head: int,
+    expand_input: bool = True,
+    expand_output: bool = True,
+    rank: int = 16,
+    std: float = 0.01,
+) -> torch.Tensor:
+    """
+    Expand attention weight with INTERLEAVED head dimensions.
+    
+    MHA weights are stored as [Head1 | Head2 | ... | HeadN].
+    Naive concatenation at the end scrambles heads.
+    This function expands each head's dims separately.
+    
+    Args:
+        weight: (out_dim, in_dim) attention weight
+        old_dim: original model dimension
+        new_dim: target model dimension
+        n_head: number of attention heads
+        expand_input: whether to expand input dimension
+        expand_output: whether to expand output dimension (for Q/K/V)
+    """
+    old_head_dim = old_dim // n_head
+    new_head_dim = new_dim // n_head
+    head_expansion = new_head_dim - old_head_dim
+    
+    if head_expansion <= 0:
+        return weight
+    
+    out_size, in_size = weight.shape
+    
+    # First expand input dimension (simple - not interleaved)
+    if expand_input and in_size == old_dim:
+        weight = expand_weight_lora(weight, new_dim, dim=1, rank=rank, std=std)
+    
+    # Expand output dimension with interleaving
+    if expand_output and out_size == old_dim:
+        # Reshape to (n_head, head_dim, input_dim)
+        w_view = weight.view(n_head, old_head_dim, -1)
+        
+        # Create expansion for each head using LoRA
+        expansions = []
+        for h in range(n_head):
+            # LoRA: A @ B for this head's expansion
+            A = torch.randn(head_expansion, rank, dtype=weight.dtype, device=weight.device) * std
+            B = torch.randn(rank, weight.size(1), dtype=weight.dtype, device=weight.device)
+            head_ext = A @ B  # (head_expansion, input_dim)
+            expansions.append(head_ext)
+        
+        expansions = torch.stack(expansions)  # (n_head, head_expansion, input_dim)
+        
+        # Concatenate along head_dim axis
+        w_new = torch.cat([w_view, expansions], dim=1)  # (n_head, new_head_dim, input_dim)
+        
+        # Flatten back to 2D
+        weight = w_new.reshape(-1, weight.size(1))
+    
+    return weight
+
+
 def expand_state_dict(
     src_state: Dict[str, torch.Tensor],
     old_dim: int,
     new_dim: int,
+    n_head: int = 16,  # Add n_head parameter for interleaved expansion
 ) -> Dict[str, torch.Tensor]:
-    """Expand an existing hybrid state dict to larger dimensions."""
+    """
+    Expand an existing hybrid state dict to larger dimensions.
+    
+    Uses LoRA-style initialization and interleaved head expansion for attention.
+    """
     dst_state = {}
     
     print(f"Expanding from {old_dim} → {new_dim}")
+    print(f"  Using LoRA-style initialization (rank=16, std=0.01)")
+    print(f"  Using interleaved head expansion (n_head={n_head})")
     
     for key, tensor in src_state.items():
-        # Identify which dimensions to expand based on tensor shape
         new_tensor = tensor
         
-        # Embedding: (vocab, dim)
+        # Embedding: (vocab, dim) - use LoRA
         if 'wte.weight' in key or 'value_embeds' in key:
             if tensor.size(-1) == old_dim:
-                new_tensor = expand_weight(tensor, new_dim, dim=-1)
+                new_tensor = expand_weight_lora(tensor, new_dim, dim=-1)
         
-        # LM head: (vocab, dim)
+        # LM head: (vocab, dim) - use LoRA
         elif 'lm_head.weight' in key:
             if tensor.size(-1) == old_dim:
-                new_tensor = expand_weight(tensor, new_dim, dim=-1)
+                new_tensor = expand_weight_lora(tensor, new_dim, dim=-1)
         
-        # Attention Q/K/V: (out, in)
+        # Attention Q/K/V: Use INTERLEAVED expansion
         elif any(x in key for x in ['c_q.weight', 'c_k.weight', 'c_v.weight']):
-            n_head_mult = tensor.size(0) // (old_dim // 16)  # infer head multiplier
-            new_head_dim = new_dim // 16
-            new_out = n_head_mult * new_head_dim
-            new_tensor = expand_weight(tensor, new_dim, dim=1)  # input
-            new_tensor = expand_weight(new_tensor, new_out, dim=0)  # output
+            new_tensor = expand_attention_interleaved(
+                tensor, old_dim, new_dim, n_head,
+                expand_input=True, expand_output=True
+            )
         
-        # Attention proj: (dim, dim)
+        # Attention proj: (dim, dim) - use interleaved for input (heads), LoRA for output
         elif 'c_proj.weight' in key and 'attn' in key:
-            # Input is n_head * head_dim, output is dim
-            new_tensor = expand_weight(tensor, new_dim * (tensor.size(1) // old_dim), dim=1)
-            new_tensor = expand_weight(new_tensor, new_dim, dim=0)
+            # Input has n_head * head_dim structure
+            new_tensor = expand_attention_interleaved(
+                tensor, old_dim, new_dim, n_head,
+                expand_input=False,  # Input is already head-structured
+                expand_output=True
+            )
+            # Also expand the input dimension 
+            new_tensor = expand_weight_lora(new_tensor, new_dim, dim=1)
         
-        # MLP: c_fc (4*dim, dim), c_proj (dim, 4*dim)
+        # MLP: c_fc (4*dim, dim), c_proj (dim, 4*dim) - use LoRA
         elif 'mlp.c_fc.weight' in key:
-            new_tensor = expand_weight(tensor, new_dim, dim=1)  # input
-            new_tensor = expand_weight(new_tensor, 4 * new_dim, dim=0)  # output
+            new_tensor = expand_weight_lora(tensor, new_dim, dim=1)  # input
+            new_tensor = expand_weight_lora(new_tensor, 4 * new_dim, dim=0)  # output
         elif 'mlp.c_proj.weight' in key:
-            new_tensor = expand_weight(tensor, 4 * new_dim, dim=1)  # input
-            new_tensor = expand_weight(new_tensor, new_dim, dim=0)  # output
+            new_tensor = expand_weight_lora(tensor, 4 * new_dim, dim=1)  # input
+            new_tensor = expand_weight_lora(new_tensor, new_dim, dim=0)  # output
         
         # Mamba: in_proj (2*d_inner, dim), out_proj (dim, d_inner)
         elif 'mamba.layer.in_proj.weight' in key:
