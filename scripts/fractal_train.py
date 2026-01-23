@@ -381,11 +381,13 @@ use_synthetic = False
 
 # Try to get first batch, fall back to synthetic if dataset not found
 try:
-    x, y, _ = next(train_loader)
+    batch = next(train_loader)
+    x, y = batch[0], batch[1]  # Handle both 2 and 3 return values
 except (AssertionError, FileNotFoundError, StopIteration) as e:
     print0(f"Dataset error, switching to synthetic data: {e}")
     train_loader = synthetic_data_loader()
-    x, y, _ = next(train_loader)
+    batch = next(train_loader)
+    x, y = batch[0], batch[1]
     use_synthetic = True
 
 while step < args.num_iterations:
@@ -422,7 +424,8 @@ while step < args.num_iterations:
         loss = loss / grad_accum_steps
         loss.backward()
         
-        x, y, _ = next(train_loader)
+        batch = next(train_loader)
+        x, y = batch[0], batch[1]
     
     # Optimizer step
     lrm = get_lr_multiplier(step)
