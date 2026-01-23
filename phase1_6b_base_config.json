@@ -1,0 +1,12 @@
+{
+  "variant": "phase1_6b_base",
+  "model_type": "adamba-hybrid",
+  "architecture": "HybridGPT (Attention + Mamba)",
+  "parameters": "6.4B",
+  "n_embd": 2048,
+  "features": [
+    "mamba_integration"
+  ],
+  "n_layers": 64,
+  "vocab_size": 65536
+}
