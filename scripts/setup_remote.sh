@@ -18,7 +18,7 @@ cd nanochat
 
 # 3. Python dependencies
 echo "Installing Python packages..."
-pip install -e .
+pip install -e .  # Install from repo root (has pyproject.toml)
 pip install mamba-ssm causal-conv1d
 pip install wandb pyarrow requests
 
