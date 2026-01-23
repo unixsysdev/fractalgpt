@@ -87,6 +87,11 @@ parser.add_argument("--eval-every", type=int, default=50, help="evaluate every N
 parser.add_argument("--train-probes", action="store_true", help="train per-layer probes")
 parser.add_argument("--use-probes", action="store_true", help="use probes for dim decisions")
 
+# Phase-aware training
+parser.add_argument("--phase", type=int, choices=[1, 2, 3], default=2,
+                    help="Training phase: 1=Mamba only (freeze attn/mlp, no Matryoshka), "
+                         "2=All + Matryoshka + Gates, 3=Expansion (train new dims)")
+
 args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
@@ -173,6 +178,77 @@ orig_model = model.module if ddp else model
 
 num_params = sum(p.numel() for p in model.parameters())
 print0(f"Number of parameters: {num_params:,}")
+
+# -----------------------------------------------------------------------------
+# Phase-specific freeze/unfreeze and Matryoshka settings
+print0(f"🔧 Phase {args.phase} configuration:")
+
+if args.phase == 1:
+    # Phase 1: Train Mamba only (freeze attention/MLP), no Matryoshka, no gates
+    print0("  ❄️  Freezing attention and MLP layers (even blocks)")
+    print0("  🔥 Training Mamba layers only (odd blocks)")
+    print0("  📐 No Matryoshka (full dims only)")
+    
+    frozen_count = 0
+    trainable_count = 0
+    
+    for name, param in orig_model.named_parameters():
+        should_train = False
+        
+        # Mamba layers (odd blocks) should train
+        if "blocks." in name:
+            try:
+                parts = name.split('.')
+                block_idx = int(parts[1]) if parts[0] == "blocks" else int(parts[2])
+                if block_idx % 2 == 1:  # Odd = Mamba
+                    should_train = True
+            except (ValueError, IndexError):
+                pass
+        
+        # Gates and dim_predictor should NOT train in Phase 1
+        if "gate" in name or "dim_predictor" in name:
+            should_train = False
+        
+        param.requires_grad = should_train
+        if should_train:
+            trainable_count += 1
+        else:
+            frozen_count += 1
+    
+    print0(f"  ❄️  Frozen: {frozen_count} tensors")
+    print0(f"  🔥 Trainable: {trainable_count} tensors")
+    
+    # Force disable Matryoshka for Phase 1
+    args.matryoshka = False
+    args.sample_dim = False
+
+elif args.phase == 2:
+    # Phase 2: Train everything with Matryoshka and gates
+    print0("  🔓 All layers trainable")
+    print0("  📐 Matryoshka enabled")
+    print0("  🚪 Gates training enabled")
+    
+    for param in orig_model.parameters():
+        param.requires_grad = True
+    
+    # Force enable Matryoshka for Phase 2
+    args.matryoshka = True
+    args.sample_dim = True
+
+elif args.phase == 3:
+    # Phase 3: Expansion - train new expanded dims, lower LR for original
+    print0("  📈 Training expanded weights")
+    print0("  📐 Matryoshka enabled")
+    
+    # All trainable (can add dim-specific LR later)
+    for param in orig_model.parameters():
+        param.requires_grad = True
+    
+    args.matryoshka = True
+    args.sample_dim = True
+
+trainable_params = sum(p.numel() for p in orig_model.parameters() if p.requires_grad)
+print0(f"Trainable parameters: {trainable_params:,} ({100*trainable_params/num_params:.1f}%)")
 
 # -----------------------------------------------------------------------------
 # Optimizer setup

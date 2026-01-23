@@ -117,31 +117,31 @@ python -m scripts.surgery --expand-from=2048 --new-dim=2560
 
 ---
 
-## TODO Before Real Training
+## Training Pipeline
 
-### 1. Stage-Dependent Freeze/Unfreeze
+### Phase-Aware Training (Implemented ✓)
 
-**Stage 1 (Train Mamba):**
-- Freeze: All attention layers (even blocks)
-- Train: Mamba layers (odd blocks) + Gates + DifficultyEstimator
-- Why: Saves 50% optimizer VRAM → bigger batch → more tokens per $
+Use `--phase` flag in `scripts/fractal_train.py`:
 
-**Stage 2+ (Expansion):**
-- Freeze: Original dims (first 2048)
-- Train: NEW expanded dims only + Mamba
-- Later: Unfreeze all with lower LR for fine-tuning
+| Phase | Command | What Trains | Matryoshka |
+|-------|---------|-------------|------------|
+| **1** | `--phase=1` | Mamba only (frozen attn/mlp) | ✗ Off |
+| **2** | `--phase=2` | All + Gates | ✓ On |
+| **3** | `--phase=3` | Expanded weights | ✓ On |
 
-**Implementation:** Add `--stage` flag to `scripts/fractal_train.py`:
-```python
-if args.stage == 1:
-    freeze_even_blocks()  # Attention
-    train_odd_blocks()    # Mamba
-elif args.stage == 2:
-    freeze_first_n_dims(2048)
-    train_expanded_dims()
+```bash
+# Phase 1: Integrate Mamba (freeze attention)
+torchrun -m scripts.fractal_train --phase=1 --checkpoint=phase1.pt
+
+# Phase 2: Matryoshka + Gates (unfreeze all)
+torchrun -m scripts.fractal_train --phase=2 --checkpoint=phase2.pt
+
+# Phase 3: After expansion surgery
+torchrun -m scripts.fractal_train --phase=3 --checkpoint=phase3.pt
 ```
 
-### 2. Smarter Expansion Initialization
+### TODO: Smarter Expansion Initialization
+
 
 **Current (Stage 1):** Mamba uses `zero-init` ✓ (correct, nothing to copy)
 
