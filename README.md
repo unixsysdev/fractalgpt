@@ -2,9 +2,10 @@
 
 > **Ad**aptive **Mamba**: Elastic compute with dynamic Matryoshka scaling
 
-**Fork of [karpathy/nanochat](https://github.com/karpathy/nanochat)**
+🤗 **[Model on HuggingFace](https://huggingface.co/datasysdev/adamba)** | 📂 **[GitHub](https://github.com/unixsysdev/adamba)**
 
 *Also known as: ElasticGPT • Accordion-Net • Dynamic Compute Budget Model*
+
 
 ## Architecture Overview
 

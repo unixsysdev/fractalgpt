@@ -150,7 +150,7 @@ pipeline_tag: text-generation
 
 > **Ad**aptive **Mamba**: Elastic compute with dynamic Matryoshka scaling
 
-**Fork of [karpathy/nanochat](https://github.com/karpathy/nanochat)**
+📂 **[GitHub](https://github.com/unixsysdev/adamba)** | 🤗 **[HuggingFace](https://huggingface.co/datasysdev/adamba)**
 
 ## Available Checkpoints
 
