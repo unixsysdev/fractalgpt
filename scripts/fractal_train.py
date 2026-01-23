@@ -470,7 +470,8 @@ while step < args.num_iterations:
         model.eval()
         with torch.no_grad(), autocast_ctx:
             # Evaluate at different dim levels
-            eval_x, eval_y, _ = next(train_loader)
+            eval_batch = next(train_loader)
+            eval_x, eval_y = eval_batch[0], eval_batch[1]
             for dim in dim_levels:
                 eval_loss = orig_model(eval_x, eval_y, active_dim=dim)
                 print0(f"  Eval @ dim={dim}: {eval_loss.item():.4f}")
@@ -520,7 +521,13 @@ while step < args.num_iterations:
 if master_process:
     final_path = checkpoint_dir / f"model_final.pt"
     torch.save(orig_model.state_dict(), final_path)
+    # Also backup to persistent storage
+    backup_dir = Path("/root/highspeedstorage/AdambaCheckpoints")
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup_final = backup_dir / f"phase{args.phase}_final.pt"
+    torch.save(orig_model.state_dict(), backup_final)
     print0(f"Training complete! Final checkpoint: {final_path}")
+    print0(f"Backup saved to: {backup_final}")
 
 if ddp:
     dist.destroy_process_group()
