@@ -754,8 +754,9 @@ class HybridGPT(nn.Module):
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
         adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
         
-        # Muon for 2D matrices only
-        if matrix_params:
+        # Muon for 2D matrices only (can be disabled with no_muon=True)
+        no_muon = kwargs.get('no_muon', False)
+        if matrix_params and not no_muon:
             muon_kwargs = dict(
                 lr=kwargs.get('matrix_lr', 0.02),
                 momentum=0.95,
@@ -765,6 +766,12 @@ class HybridGPT(nn.Module):
             muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
             optimizers = [adamw_optimizer, muon_optimizer]
         else:
+            # Add matrix params to AdamW instead
+            if matrix_params and no_muon:
+                model_dim = self.config.n_embd_expanded
+                dmodel_lr_scale = (model_dim / 768) ** -0.5
+                adam_groups.append(dict(params=matrix_params, lr=kwargs.get('matrix_lr', 0.02) * dmodel_lr_scale))
+                adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
             optimizers = [adamw_optimizer]
         
         for opt in optimizers:

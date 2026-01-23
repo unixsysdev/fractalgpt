@@ -103,6 +103,7 @@ parser.add_argument("--compile", action="store_true", help="use torch.compile fo
 parser.add_argument("--compile-mode", type=str, default="reduce-overhead", 
                     choices=["default", "reduce-overhead", "max-autotune"],
                     help="torch.compile mode")
+parser.add_argument("--no-muon", action="store_true", help="disable Muon optimizer (use AdamW only, saves memory)")
 
 args = parser.parse_args()
 
@@ -289,10 +290,11 @@ optimizers = orig_model.setup_optimizers(
     matrix_lr=args.matrix_lr,
     embedding_lr=args.embedding_lr,
     probe_lr=args.probe_lr,
+    no_muon=args.no_muon,
 )
 
 # Get Muon optimizer for momentum scheduling
-muon_optimizer = optimizers[1] if len(optimizers) > 1 else None
+muon_optimizer = optimizers[1] if len(optimizers) > 1 and not args.no_muon else None
 
 # -----------------------------------------------------------------------------
 # Data loader
