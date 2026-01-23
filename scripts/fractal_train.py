@@ -153,7 +153,7 @@ print0("Setting up model...")
 # Create config
 config = HybridConfig(
     sequence_len=args.max_seq_len,
-    vocab_size=32768,
+    vocab_size=65536,  # nanochat uses 64K vocab
     n_layer=args.depth,
     n_mamba_layer=args.n_mamba,
     n_head=expanded_dim // args.head_dim,
