@@ -174,7 +174,26 @@ model = model.to_empty(device=device)
 if args.checkpoint and args.checkpoint.exists():
     print0(f"Loading checkpoint: {args.checkpoint}")
     state_dict = torch.load(args.checkpoint, map_location=device, weights_only=True)
-    model.load_state_dict(state_dict, strict=False)
+    
+    # Filter out keys with shape mismatches (strict=False doesn't handle this)
+    model_state = model.state_dict()
+    filtered_state = {}
+    skipped = []
+    for k, v in state_dict.items():
+        if k in model_state:
+            if v.shape == model_state[k].shape:
+                filtered_state[k] = v
+            else:
+                skipped.append(f"{k}: checkpoint {v.shape} vs model {model_state[k].shape}")
+        else:
+            filtered_state[k] = v  # New keys, let strict=False handle
+    
+    if skipped:
+        print0(f"  Skipped {len(skipped)} mismatched keys:")
+        for s in skipped[:5]:  # Show first 5
+            print0(f"    {s}")
+    
+    model.load_state_dict(filtered_state, strict=False)
 else:
     print0("Initializing fresh weights...")
     model.init_weights()
