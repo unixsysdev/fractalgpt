@@ -450,6 +450,12 @@ while step < args.num_iterations:
             torch.save(orig_model.state_dict(), ckpt_path)
             saved_checkpoints.append(ckpt_path)
             
+            # Backup latest to separate volume (survives machine failure)
+            backup_dir = Path("/root/highspeedstorage/AdambaCheckpoints")
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = backup_dir / "latest_checkpoint.pt"
+            torch.save(orig_model.state_dict(), backup_path)
+            
             # Checkpoint rotation: keep only last N
             if args.keep_checkpoints > 0 and len(saved_checkpoints) > args.keep_checkpoints:
                 old_ckpt = saved_checkpoints.pop(0)
@@ -468,7 +474,11 @@ while step < args.num_iterations:
                     "step": step,
                 }, f)
             
-            print0(f"Saved checkpoint: {ckpt_path}")
+            # Also copy config to backup
+            import shutil
+            shutil.copy(config_path, backup_dir / "config.json")
+            
+            print0(f"Saved checkpoint: {ckpt_path} + backup")
     
     step += 1
 
