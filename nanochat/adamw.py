@@ -79,6 +79,12 @@ class DistAdamW(torch.optim.Optimizer):
             params: list[Tensor] = group["params"]
             for p in params:
                 grad = p.grad
+                # Skip if no gradient (frozen param)
+                if grad is None:
+                    is_small.append(None)  # Marker for skipped
+                    reduce_futures.append(None)
+                    grad_slices.append(None)
+                    continue
                 # Small params: use all_reduce (no scatter/gather needed)
                 if p.numel() < 1024:
                     is_small.append(True)
@@ -98,6 +104,11 @@ class DistAdamW(torch.optim.Optimizer):
             wd = group['weight_decay']
             params = group['params']
             for p in params:
+                # Skip if this param was skipped (no gradient)
+                if is_small[idx] is None:
+                    idx += 1
+                    continue
+                    
                 reduce_futures[idx].wait()
                 g_slice = grad_slices[idx]
                 lr = group['lr'] * getattr(p, "lr_mul", 1.0)
