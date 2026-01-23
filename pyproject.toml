@@ -26,6 +26,14 @@ dependencies = [
     "zstandard>=0.25.0",
 ]
 
+[tool.setuptools.packages.find]
+include = ["nanochat", "nanochat.*"]
+exclude = ["dev", "runs", "tiny_experiment", "tests"]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
 [dependency-groups]
 dev = [
     "pytest>=8.0.0",
