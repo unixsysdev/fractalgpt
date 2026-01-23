@@ -48,14 +48,26 @@ def load_model(checkpoint_path: Path, device: str = "auto"):
     
     # Count layers
     n_layer = 0
-    n_mamba = 0
     for key in state_dict.keys():
         if key.startswith("blocks."):
             layer_num = int(key.split(".")[1])
             n_layer = max(n_layer, layer_num + 1)
-            if ".mamba." in key:
-                n_mamba += 1
-    n_mamba = n_mamba // 10  # Rough estimate (multiple keys per mamba block)
+    
+    # Infer Mamba dt_rank from checkpoint (look at dt_proj.weight shape)
+    dt_rank = 128  # default
+    for key, tensor in state_dict.items():
+        if "mamba.mamba.dt_proj.weight" in key:
+            dt_rank = tensor.shape[1]  # [d_inner, dt_rank]
+            break
+    
+    # Infer d_state from x_proj shape
+    d_state = 128  # default
+    for key, tensor in state_dict.items():
+        if "mamba.mamba.x_proj.weight" in key:
+            # x_proj.weight shape: [dt_rank + d_state*2, d_inner]
+            # So d_state*2 = shape[0] - dt_rank
+            d_state = (tensor.shape[0] - dt_rank) // 2
+            break
     
     print(f"  Config: vocab={vocab_size}, n_embd={n_embd}, n_layer={n_layer}")
     

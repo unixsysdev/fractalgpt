@@ -26,25 +26,39 @@ class SSMFallback(nn.Module):
     """
     Simple SSM fallback when mamba-ssm is not available.
     Uses a basic linear recurrence for testing purposes.
+    
+    Matches the weight shapes of mamba_ssm.Mamba for checkpoint compatibility.
     """
-    def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4, expand: int = 2):
+    def __init__(self, d_model: int, d_state: int = 128, d_conv: int = 4, expand: int = 2):
         super().__init__()
         self.d_model = d_model
         self.d_inner = d_model * expand
+        self.d_state = d_state
+        self.d_conv = d_conv
         
-        # Projections
+        # Compute dt_rank (matches mamba-ssm default: ceil(d_model / 16))
+        import math
+        self.dt_rank = math.ceil(d_model / 16)
+        
+        # Match mamba-ssm layer names and shapes exactly
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
         self.conv1d = nn.Conv1d(
             self.d_inner, self.d_inner,
             kernel_size=d_conv, padding=d_conv - 1,
             groups=self.d_inner, bias=True
         )
-        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
         
-        # SSM parameters (simplified)
-        self.dt_proj = nn.Linear(self.d_inner, self.d_inner, bias=True)
-        self.A = nn.Parameter(torch.randn(self.d_inner, d_state))
+        # x_proj: projects to dt, B, C (dt_rank + d_state * 2)
+        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + d_state * 2, bias=False)
+        
+        # dt_proj: from dt_rank to d_inner  
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
+        
+        # SSM parameters
+        self.A_log = nn.Parameter(torch.randn(self.d_inner, d_state))
         self.D = nn.Parameter(torch.ones(self.d_inner))
+        
+        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
