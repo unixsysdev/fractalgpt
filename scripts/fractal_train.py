@@ -80,8 +80,10 @@ parser.add_argument("--probe-lr", type=float, default=0.01, help="LR for probes"
 
 # Checkpointing
 parser.add_argument("--checkpoint", type=Path, default=None, help="path to hybrid checkpoint")
-parser.add_argument("--save-every", type=int, default=100, help="save checkpoint every N steps")
+parser.add_argument("--save-every", type=int, default=50, help="save checkpoint every N steps")
 parser.add_argument("--eval-every", type=int, default=50, help="evaluate every N steps")
+parser.add_argument("--keep-checkpoints", type=int, default=3, help="keep only last N checkpoints (0=keep all)")
+parser.add_argument("--resume", action="store_true", help="resume from checkpoint (load optimizer state)")
 
 # Probes
 parser.add_argument("--train-probes", action="store_true", help="train per-layer probes")
@@ -91,6 +93,12 @@ parser.add_argument("--use-probes", action="store_true", help="use probes for di
 parser.add_argument("--phase", type=int, choices=[1, 2, 3], default=2,
                     help="Training phase: 1=Mamba only (freeze attn/mlp, no Matryoshka), "
                          "2=All + Matryoshka + Gates, 3=Expansion (train new dims)")
+
+# Performance optimizations
+parser.add_argument("--compile", action="store_true", help="use torch.compile for faster training")
+parser.add_argument("--compile-mode", type=str, default="reduce-overhead", 
+                    choices=["default", "reduce-overhead", "max-autotune"],
+                    help="torch.compile mode")
 
 args = parser.parse_args()
 
@@ -319,11 +327,21 @@ else:
     wandb_run = type('DummyRun', (), {'log': lambda *a, **kw: None})()
 
 # -----------------------------------------------------------------------------
+# torch.compile for faster training
+if args.compile and hasattr(torch, 'compile'):
+    print0(f"🚀 Compiling model with torch.compile (mode={args.compile_mode})...")
+    model = torch.compile(model, mode=args.compile_mode)
+    print0("   Compilation will happen on first forward pass")
+
+# -----------------------------------------------------------------------------
 # Training loop
 print0("Starting training...")
 
 checkpoint_dir = Path.home() / ".cache/nanochat/fractal_checkpoints" / args.run
 checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+# Track checkpoints for rotation
+saved_checkpoints = []
 
 model.train()
 step = 0
@@ -430,6 +448,14 @@ while step < args.num_iterations:
         if master_process:
             ckpt_path = checkpoint_dir / f"model_{step:06d}.pt"
             torch.save(orig_model.state_dict(), ckpt_path)
+            saved_checkpoints.append(ckpt_path)
+            
+            # Checkpoint rotation: keep only last N
+            if args.keep_checkpoints > 0 and len(saved_checkpoints) > args.keep_checkpoints:
+                old_ckpt = saved_checkpoints.pop(0)
+                if old_ckpt.exists():
+                    old_ckpt.unlink()
+                    print0(f"  Deleted old checkpoint: {old_ckpt.name}")
             
             # Save config
             config_path = checkpoint_dir / "config.json"
@@ -439,6 +465,7 @@ while step < args.num_iterations:
                     "n_mamba_layer": config.n_mamba_layer,
                     "n_embd_expanded": config.n_embd_expanded,
                     "dim_levels": dim_levels,
+                    "step": step,
                 }, f)
             
             print0(f"Saved checkpoint: {ckpt_path}")
