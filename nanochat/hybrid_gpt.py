@@ -690,6 +690,7 @@ class HybridGPT(nn.Module):
         ddp, rank, local_rank, world_size = get_dist_info()
         
         # Separate parameters - Muon only works with 2D matrices
+        # ONLY include trainable params (requires_grad=True)
         matrix_params = []  # 2D only, for Muon
         non_matrix_params = []  # Non-2D, goes to AdamW
         probe_params = []
@@ -697,6 +698,8 @@ class HybridGPT(nn.Module):
         for block in self.blocks:
             if block.is_attention:
                 for p in block.attn.parameters():
+                    if not p.requires_grad:
+                        continue  # Skip frozen
                     if p.ndim == 2:
                         matrix_params.append(p)
                     else:
@@ -704,6 +707,8 @@ class HybridGPT(nn.Module):
             else:
                 # Mamba has some non-2D params (conv1d, etc)
                 for p in block.mamba.parameters():
+                    if not p.requires_grad:
+                        continue  # Skip frozen
                     if p.ndim == 2:
                         matrix_params.append(p)
                     else:
@@ -711,18 +716,21 @@ class HybridGPT(nn.Module):
             
             # MLP params
             for p in block.mlp.parameters():
+                if not p.requires_grad:
+                    continue  # Skip frozen
                 if p.ndim == 2:
                     matrix_params.append(p)
                 else:
                     non_matrix_params.append(p)
             
-            probe_params.extend(list(block.probe.parameters()))
+            probe_params.extend([p for p in block.probe.parameters() if p.requires_grad])
         
-        embedding_params = list(self.transformer.wte.parameters())
-        lm_head_params = list(self.lm_head.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
-        think_params = list(self.think_detector.parameters())
-        scalar_params = [self.resid_lambdas, self.x0_lambdas]
+        # Filter trainable only
+        embedding_params = [p for p in self.transformer.wte.parameters() if p.requires_grad]
+        lm_head_params = [p for p in self.lm_head.parameters() if p.requires_grad]
+        value_embeds_params = [p for p in self.value_embeds.parameters() if p.requires_grad]
+        think_params = [p for p in self.think_detector.parameters() if p.requires_grad]
+        scalar_params = [p for p in [self.resid_lambdas, self.x0_lambdas] if p.requires_grad]
         
         # LR scaling
         model_dim = self.config.n_embd_expanded
