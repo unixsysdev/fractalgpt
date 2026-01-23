@@ -104,6 +104,7 @@ parser.add_argument("--compile-mode", type=str, default="reduce-overhead",
                     choices=["default", "reduce-overhead", "max-autotune"],
                     help="torch.compile mode")
 parser.add_argument("--no-muon", action="store_true", help="disable Muon optimizer (use AdamW only, saves memory)")
+parser.add_argument("--gradient-checkpointing", action="store_true", help="use gradient checkpointing (saves ~50%% memory)")
 
 args = parser.parse_args()
 
@@ -174,6 +175,11 @@ with torch.device("meta"):
 
 # Materialize on device
 model = model.to_empty(device=device)
+
+# Enable gradient checkpointing (saves ~50% memory)
+if args.gradient_checkpointing:
+    model.gradient_checkpointing = True
+    print0("🧠 Gradient checkpointing enabled (saves memory, slower training)")
 
 # Load checkpoint or init fresh
 if args.checkpoint and args.checkpoint.exists():

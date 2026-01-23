@@ -345,6 +345,9 @@ class HybridGPT(nn.Module):
         self.expand_threshold = 0.5
         self.min_layers_before_exit = len(self.blocks) // 4  # Exit after 25% of layers
         
+        # Gradient checkpointing (saves memory by recomputing activations)
+        self.gradient_checkpointing = False
+        
         # Rotary embeddings
         self.rotary_seq_len = config.sequence_len * 2
         head_dim = config.n_embd_expanded // config.n_head
@@ -462,13 +465,19 @@ class HybridGPT(nn.Module):
             if block.is_attention and str(i) in self.value_embeds:
                 ve = self.value_embeds[str(i)](idx)
             
-            # Forward block
-            x, conf = block(
-                x, ve, cos_sin, self.window_sizes[i], kv_cache,
-                active_dim=active_dim,
-                layer_outputs=layer_outputs,
-                use_probe=use_probes,
-            )
+            # Forward block (with optional gradient checkpointing)
+            if self.gradient_checkpointing and self.training:
+                from torch.utils.checkpoint import checkpoint
+                def block_forward(x_, ve_, cos_sin_, window_size_, active_dim_):
+                    return block(x_, ve_, cos_sin_, window_size_, None, active_dim=active_dim_)
+                x, conf = checkpoint(block_forward, x, ve, cos_sin, self.window_sizes[i], active_dim, use_reentrant=False)
+            else:
+                x, conf = block(
+                    x, ve, cos_sin, self.window_sizes[i], kv_cache,
+                    active_dim=active_dim,
+                    layer_outputs=layer_outputs,
+                    use_probe=use_probes,
+                )
             
             confidences.append(conf)
             
