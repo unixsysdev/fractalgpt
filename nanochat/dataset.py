@@ -17,15 +17,88 @@ from multiprocessing import Pool
 from nanochat.common import get_base_dir
 
 # -----------------------------------------------------------------------------
+# Dataset Registry - Multiple datasets for different training phases
+# -----------------------------------------------------------------------------
+
+DATASET_REGISTRY = {
+    # Pre-training
+    "fineweb": {
+        "url": "https://huggingface.co/datasets/karpathy/fineweb-edu-100b-shuffle/resolve/main",
+        "max_shard": 1822,
+        "filename_fmt": "shard_{:05d}.parquet",
+        "text_column": "text",
+        "description": "FineWeb-Edu 100B (pre-training)",
+    },
+    
+    # SFT - General instruction following
+    "openorca": {
+        "url": "https://huggingface.co/datasets/Open-Orca/OpenOrca/resolve/main",
+        "max_shard": 0,  # Single file
+        "filename_fmt": "openorca.parquet",
+        "text_column": "response",
+        "description": "OpenOrca instruction dataset",
+    },
+    
+    # CoT - Chain of Thought
+    "flan_cot": {
+        "url": "https://huggingface.co/datasets/conceptofmind/FLAN2021_CoT/resolve/main",
+        "max_shard": 0,
+        "filename_fmt": "data.parquet",
+        "text_column": "target",
+        "description": "FLAN Chain-of-Thought reasoning",
+    },
+    
+    # Math reasoning
+    "metamath": {
+        "url": "https://huggingface.co/datasets/meta-math/MetaMathQA/resolve/main",
+        "max_shard": 0,
+        "filename_fmt": "train.parquet",
+        "text_column": "response",
+        "description": "MetaMathQA for math reasoning",
+    },
+    
+    # Function calling
+    "glaive_fc": {
+        "url": "https://huggingface.co/datasets/glaiveai/glaive-function-calling-v2/resolve/main",
+        "max_shard": 0,
+        "filename_fmt": "data.parquet",
+        "text_column": "answer",
+        "description": "Glaive function calling dataset",
+    },
+    
+    # Chat/ShareGPT style
+    "sharegpt": {
+        "url": "https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/resolve/main",
+        "max_shard": 0,
+        "filename_fmt": "ShareGPT_V3_filtered.parquet",
+        "text_column": "conversations",
+        "description": "ShareGPT conversations",
+    },
+}
+
+# Default dataset (original behavior)
+DEFAULT_DATASET = "fineweb"
+
+# -----------------------------------------------------------------------------
 # The specifics of the current pretraining dataset
 
-# The URL on the internet where the data is hosted and downloaded from on demand
-BASE_URL = "https://huggingface.co/datasets/karpathy/fineweb-edu-100b-shuffle/resolve/main"
-MAX_SHARD = 1822 # the last datashard is shard_01822.parquet
-index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
+def get_dataset_config(dataset_name: str = None):
+    """Get configuration for a dataset."""
+    name = dataset_name or DEFAULT_DATASET
+    if name not in DATASET_REGISTRY:
+        raise ValueError(f"Unknown dataset: {name}. Available: {list(DATASET_REGISTRY.keys())}")
+    return DATASET_REGISTRY[name]
+
+# Legacy compatibility
+config = get_dataset_config(DEFAULT_DATASET)
+BASE_URL = config["url"]
+MAX_SHARD = config["max_shard"]
+index_to_filename = lambda index: config["filename_fmt"].format(index)
+
 base_dir = get_base_dir()
 DATA_DIR = os.path.join(base_dir, "base_data")
 os.makedirs(DATA_DIR, exist_ok=True)
+
 
 # -----------------------------------------------------------------------------
 # These functions are useful utilities to other modules, can/should be imported
