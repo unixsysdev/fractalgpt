@@ -512,6 +512,8 @@ try:
                 return self.hf_tok.encode(text, add_special_tokens=False)
             def decode(self, tokens):
                 return self.hf_tok.decode(tokens)
+            def get_bos_token_id(self):
+                return self.hf_tok.bos_token_id if self.hf_tok.bos_token_id is not None else 0
             @property
             def n_vocab(self):
                 return self.hf_tok.vocab_size
