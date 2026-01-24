@@ -253,51 +253,60 @@ else:
     with torch.device("meta"):
         model = HybridGPT(config)
 
-# For large models with FSDP: materialize on CPU first, then FSDP handles GPU sharding
+# For large models with FSDP: only rank 0 loads the full model
+# Other ranks stay empty, FSDP will broadcast via sync_module_states
 if ddp and args.model_type == "gptoss":
-    # Large model: use CPU for initial weights to avoid OOM during FSDP flattening
-    init_device = "cpu"
-    print0("Using CPU for initial weight loading (FSDP will shard to GPU)")
+    rank = int(os.environ.get("RANK", 0))
+    if rank == 0:
+        init_device = "cpu"
+        print0("Rank 0: Loading model to CPU (FSDP will broadcast to all ranks)")
+    else:
+        # Other ranks: keep on meta device, FSDP will broadcast from rank 0
+        init_device = "meta"
 else:
     init_device = device
+    rank = 0
 
-model = model.to_empty(device=init_device)
+if init_device != "meta":
+    model = model.to_empty(device=init_device)
 
 # Enable gradient checkpointing (saves ~50% memory)
 if args.gradient_checkpointing:
     model.gradient_checkpointing = True
     print0("🧠 Gradient checkpointing enabled (saves memory, slower training)")
 
-# Load checkpoint or init fresh
+# Load checkpoint or init fresh - ONLY on rank 0 for large models
 if args.checkpoint and args.checkpoint.exists():
-    print0(f"Loading checkpoint: {args.checkpoint}")
-    # Always load to CPU first for large models
-    state_dict = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    
-    # Filter out keys with shape mismatches (strict=False doesn't handle this)
-    model_state = model.state_dict()
-    filtered_state = {}
-    skipped = []
-    for k, v in state_dict.items():
-        if k in model_state:
-            if v.shape == model_state[k].shape:
-                filtered_state[k] = v
+    if init_device != "meta":  # Only load if we're not on meta device
+        print0(f"Loading checkpoint: {args.checkpoint}")
+        # Always load to CPU first for large models
+        state_dict = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+        
+        # Filter out keys with shape mismatches (strict=False doesn't handle this)
+        model_state = model.state_dict()
+        filtered_state = {}
+        skipped = []
+        for k, v in state_dict.items():
+            if k in model_state:
+                if v.shape == model_state[k].shape:
+                    filtered_state[k] = v
+                else:
+                    skipped.append(f"{k}: checkpoint {v.shape} vs model {model_state[k].shape}")
             else:
-                skipped.append(f"{k}: checkpoint {v.shape} vs model {model_state[k].shape}")
-        else:
-            filtered_state[k] = v  # New keys, let strict=False handle
-    
-    if skipped:
-        print0(f"  Skipped {len(skipped)} mismatched keys:")
-        for s in skipped[:5]:  # Show first 5
-            print0(f"    {s}")
-    
-    model.load_state_dict(filtered_state, strict=False)
-    del state_dict, filtered_state  # Free CPU memory
-    import gc; gc.collect()
+                filtered_state[k] = v  # New keys, let strict=False handle
+        
+        if skipped:
+            print0(f"  Skipped {len(skipped)} mismatched keys:")
+            for s in skipped[:5]:  # Show first 5
+                print0(f"    {s}")
+        
+        model.load_state_dict(filtered_state, strict=False)
+        del state_dict, filtered_state  # Free CPU memory
+        import gc; gc.collect()
 else:
-    print0("Initializing fresh weights...")
-    model.init_weights()
+    if init_device != "meta":
+        print0("Initializing fresh weights...")
+        model.init_weights()
 
 # Wrap in DDP if needed
 # FSDP Setup
@@ -341,6 +350,10 @@ if ddp:
         reduce_dtype=torch.bfloat16,
         buffer_dtype=torch.float32,
     )
+    
+    # For large models: use CPU offload during FSDP init to avoid OOM
+    from torch.distributed.fsdp import CPUOffload
+    cpu_offload = CPUOffload(offload_params=False) if args.model_type == "gptoss" else None
 
     model = FSDP(
         model,
@@ -351,6 +364,7 @@ if ddp:
         limit_all_gathers=True,
         use_orig_params=True, # Needed for torch.compile
         sync_module_states=True, # Broadcast weights from rank 0 (needed for CPU loading)
+        cpu_offload=cpu_offload,
     )
     
     print0(f"FSDP wrapping complete. Sharding strategy: FULL_SHARD")
