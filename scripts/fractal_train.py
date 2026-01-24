@@ -688,7 +688,7 @@ while step < args.num_iterations:
             saved_checkpoints.append(ckpt_path)
             
             # Backup latest to separate volume (survives machine failure)
-            backup_dir = Path("/root/highspeedstorage/AdambaCheckpoints")
+            backup_dir = Path("/mnt/pt/adamba_checkpoints")
             backup_dir.mkdir(parents=True, exist_ok=True)
             backup_path = backup_dir / "latest_checkpoint.pt"
             torch.save(orig_model.state_dict(), backup_path)
