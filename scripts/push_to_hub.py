@@ -63,8 +63,11 @@ def main():
     if not args.checkpoint.exists():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
     
-    # Setup repo ID
-    repo_id = f"{args.org}/{args.repo_id}"
+    # Setup repo ID - only add org prefix if not already namespaced
+    if "/" in args.repo_id:
+        repo_id = args.repo_id  # Already has namespace
+    else:
+        repo_id = f"{args.org}/{args.repo_id}"
     variant_info = VARIANTS[args.variant]
     
     print(f"📦 Preparing to push {args.variant} to: {repo_id}")
