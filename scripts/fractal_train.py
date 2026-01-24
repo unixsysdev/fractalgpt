@@ -688,8 +688,20 @@ while step < args.num_iterations:
                 save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
                 with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
                     state_dict = model.state_dict()
-                    if master_process:
-                        torch.save(state_dict, backup_path)
+                
+                # Barrier to ensure all ranks complete before continuing training
+                dist.barrier()
+                
+                if master_process:
+                    # Convert to bfloat16 for smaller checkpoint (~45GB instead of ~90GB)
+                    for k, v in state_dict.items():
+                        if v.dtype == torch.float32:
+                            state_dict[k] = v.to(torch.bfloat16)
+                    torch.save(state_dict, backup_path)
+                    del state_dict  # Free memory
+                
+                # Another barrier after save
+                dist.barrier()
             else:
                 torch.save(model.state_dict(), backup_path)
             
