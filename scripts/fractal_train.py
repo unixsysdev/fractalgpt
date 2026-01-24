@@ -311,9 +311,15 @@ def get_fsdp_policy(model_type):
         MoEBlock,
     }
     
-    return lambda module, recurse, nonwrapped_child_numel: transformer_auto_wrap_policy(
-        module, recurse, nonwrapped_child_numel, transformer_layer_cls=transformer_layer_cls
-    )
+    # Use **kwargs for compatibility with different PyTorch versions
+    def policy_fn(module, recurse, **kwargs):
+        # Extract nonwrapped_numel from kwargs (different PyTorch versions use different names)
+        nonwrapped_numel = kwargs.get('nonwrapped_numel', kwargs.get('nonwrapped_child_numel', 0))
+        return transformer_auto_wrap_policy(
+            module, recurse, nonwrapped_numel, transformer_layer_cls=transformer_layer_cls
+        )
+    
+    return policy_fn
 
 if ddp:
     print0("Wrapping model with FSDP...")

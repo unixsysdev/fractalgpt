@@ -67,6 +67,7 @@ class HybridConfig:
     n_kv_head: int = 16
     n_embd: int = 2048  # Base dimension
     n_embd_expanded: int = 4096  # Expanded dimension for Matryoshka
+    head_dim: int = 0  # 0 = auto (n_embd_expanded // n_head), or explicit for GPT-OSS
     window_pattern: str = "SSSL"
     
     # Matryoshka config
@@ -95,18 +96,18 @@ class MatryoshkaAttention(nn.Module):
         self.layer_idx = layer_idx
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
-        self.n_embd = config.n_embd_expanded  # Use expanded dim
-        self.head_dim = self.n_embd // self.n_head
+        self.n_embd = config.n_embd_expanded  # Use expanded dim for projections
+        self.n_embd_input = config.n_embd  # Input dimension
+        # Use explicit head_dim if provided, otherwise calculate
+        self.head_dim = config.head_dim if config.head_dim > 0 else self.n_embd // self.n_head
         self.kv_dim_levels = config.kv_dim_levels
         
-        assert self.n_embd % self.n_head == 0
-        assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        
         # Full-size projections (Matryoshka slicing done at runtime)
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        # Input is n_embd, output is n_head * head_dim
+        self.c_q = nn.Linear(self.n_embd_input, self.n_head * self.head_dim, bias=False)
+        self.c_k = nn.Linear(self.n_embd_input, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = nn.Linear(self.n_embd_input, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = nn.Linear(self.n_head * self.head_dim, self.n_embd_input, bias=False)
         
         # Value embedding gate (like nanochat)
         self.ve_gate_channels = 32
@@ -1039,18 +1040,16 @@ class GptOssBlock(nn.Module):
         
         # Attention
         self.attn_norm = nn.RMSNorm(config.hidden_size, eps=1e-5)
-        # Using standard attention for now, need sliding/GQA support
-        # Reusing MatryoshkaAttention but configured for GQA?
-        # MatryoshkaAttention assumes dense heads.
-        # For Phase 1 we can wrap standard GQA logic if available, 
-        # or implement a lightweight GQA wrapper here.
-        # Given constraints, let's use a simplified placeholder that matches weights
+        # GPT-OSS uses head_dim=64 with 64 heads = 4096 total for Q
+        # But hidden_size is 2880, so we need expanded attention dim
+        attn_dim = config.num_attention_heads * config.head_dim  # 64 * 64 = 4096
         self.attn = MatryoshkaAttention(
             config=HybridConfig(
-                n_embd=config.hidden_size,
+                n_embd=config.hidden_size,  # Input dim
                 n_head=config.num_attention_heads,
                 n_kv_head=config.num_key_value_heads,
-                n_embd_expanded=config.hidden_size # No expansion for base GPT-OSS
+                n_embd_expanded=attn_dim,  # Q/K/V projection output dim
+                head_dim=config.head_dim,  # Explicit head_dim
             ),
             layer_idx=layer_idx
         )
