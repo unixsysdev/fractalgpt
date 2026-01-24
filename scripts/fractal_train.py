@@ -499,33 +499,32 @@ def synthetic_data_loader():
 try:
     # Use correct tokenizer for model type
     if args.model_type == "gptoss":
-        # GPT-OSS uses OpenAI's o200k_base tokenizer (200k vocab)
-        import tiktoken
-        enc = tiktoken.get_encoding("o200k_base")
-        print0(f"Using o200k_base tokenizer for GPT-OSS (vocab size: {enc.n_vocab})")
+        # Use official GPT-OSS tokenizer from HuggingFace
+        from transformers import AutoTokenizer
+        hf_tokenizer = AutoTokenizer.from_pretrained("openai/gpt-oss-20b")
+        print0(f"Using GPT-OSS tokenizer (vocab size: {hf_tokenizer.vocab_size})")
         
         # Create a wrapper that matches nanochat tokenizer interface
         class TokenizerWrapper:
-            def __init__(self, enc):
-                self.enc = enc
+            def __init__(self, hf_tok):
+                self.hf_tok = hf_tok
             def encode(self, texts, prepend=None, num_threads=1):
                 # Batch encode - texts is a list of strings
                 results = []
                 for text in texts:
-                    tokens = self.enc.encode(text, allowed_special="all")
+                    tokens = self.hf_tok.encode(text, add_special_tokens=False)
                     if prepend is not None:
-                        tokens = [prepend] + tokens
+                        tokens = [prepend] + list(tokens)
                     results.append(tokens)
                 return results
             def decode(self, tokens):
-                return self.enc.decode(tokens)
+                return self.hf_tok.decode(tokens)
             def get_bos_token_id(self):
-                # Use a safe BOS token
-                return 0
+                return self.hf_tok.bos_token_id if self.hf_tok.bos_token_id is not None else 0
             @property
             def n_vocab(self):
-                return self.enc.n_vocab
-        tokenizer = TokenizerWrapper(enc)
+                return self.hf_tok.vocab_size
+        tokenizer = TokenizerWrapper(hf_tokenizer)
     else:
         tokenizer = get_tokenizer()
     
