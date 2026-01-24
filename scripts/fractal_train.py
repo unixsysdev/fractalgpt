@@ -253,22 +253,20 @@ else:
     with torch.device("meta"):
         model = HybridGPT(config)
 
-# For large models with FSDP: only rank 0 loads the full model
-# Other ranks stay empty, FSDP will broadcast via sync_module_states
+# For large models with FSDP: all ranks create empty CPU tensors
+# Only rank 0 loads the checkpoint, FSDP broadcasts via sync_module_states
 if ddp and args.model_type == "gptoss":
     rank = int(os.environ.get("RANK", 0))
+    init_device = "cpu"  # All ranks use CPU tensors
     if rank == 0:
-        init_device = "cpu"
-        print0("Rank 0: Loading model to CPU (FSDP will broadcast to all ranks)")
+        print0("Rank 0: Will load checkpoint to CPU (FSDP will broadcast to all ranks)")
     else:
-        # Other ranks: keep on meta device, FSDP will broadcast from rank 0
-        init_device = "meta"
+        print0(f"Rank {rank}: Creating empty CPU tensors (will receive from rank 0)")
 else:
     init_device = device
     rank = 0
 
-if init_device != "meta":
-    model = model.to_empty(device=init_device)
+model = model.to_empty(device=init_device)
 
 # Enable gradient checkpointing (saves ~50% memory)
 if args.gradient_checkpointing:
@@ -277,7 +275,7 @@ if args.gradient_checkpointing:
 
 # Load checkpoint or init fresh - ONLY on rank 0 for large models
 if args.checkpoint and args.checkpoint.exists():
-    if init_device != "meta":  # Only load if we're not on meta device
+    if rank == 0:  # Only rank 0 loads the checkpoint
         print0(f"Loading checkpoint: {args.checkpoint}")
         # Always load to CPU first for large models
         state_dict = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
@@ -303,8 +301,9 @@ if args.checkpoint and args.checkpoint.exists():
         model.load_state_dict(filtered_state, strict=False)
         del state_dict, filtered_state  # Free CPU memory
         import gc; gc.collect()
+    # Other ranks: keep empty tensors, FSDP will sync from rank 0
 else:
-    if init_device != "meta":
+    if rank == 0:
         print0("Initializing fresh weights...")
         model.init_weights()
 
