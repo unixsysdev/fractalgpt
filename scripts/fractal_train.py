@@ -253,8 +253,15 @@ else:
     with torch.device("meta"):
         model = HybridGPT(config)
 
-# Materialize on device
-model = model.to_empty(device=device)
+# For large models with FSDP: materialize on CPU first, then FSDP handles GPU sharding
+if ddp and args.model_type == "gptoss":
+    # Large model: use CPU for initial weights to avoid OOM during FSDP flattening
+    init_device = "cpu"
+    print0("Using CPU for initial weight loading (FSDP will shard to GPU)")
+else:
+    init_device = device
+
+model = model.to_empty(device=init_device)
 
 # Enable gradient checkpointing (saves ~50% memory)
 if args.gradient_checkpointing:
@@ -264,7 +271,8 @@ if args.gradient_checkpointing:
 # Load checkpoint or init fresh
 if args.checkpoint and args.checkpoint.exists():
     print0(f"Loading checkpoint: {args.checkpoint}")
-    state_dict = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    # Always load to CPU first for large models
+    state_dict = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
     
     # Filter out keys with shape mismatches (strict=False doesn't handle this)
     model_state = model.state_dict()
@@ -285,6 +293,8 @@ if args.checkpoint and args.checkpoint.exists():
             print0(f"    {s}")
     
     model.load_state_dict(filtered_state, strict=False)
+    del state_dict, filtered_state  # Free CPU memory
+    import gc; gc.collect()
 else:
     print0("Initializing fresh weights...")
     model.init_weights()
@@ -340,6 +350,7 @@ if ddp:
         device_id=torch.cuda.current_device(),
         limit_all_gathers=True,
         use_orig_params=True, # Needed for torch.compile
+        sync_module_states=True, # Broadcast weights from rank 0 (needed for CPU loading)
     )
     
     print0(f"FSDP wrapping complete. Sharding strategy: FULL_SHARD")
