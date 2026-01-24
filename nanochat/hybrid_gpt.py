@@ -854,7 +854,7 @@ class GptOssMoEConfig:
     """Configuration for GPT-OSS 20B MoE hybrid model."""
     # Model dimensions
     hidden_size: int = 2880
-    intermediate_size: int = 7680  # GPT-OSS 20B: 2880 * 2.67 for expert MLPs
+    intermediate_size: int = 2880
     vocab_size: int = 201088
     
     # Layer structure
