@@ -68,6 +68,7 @@ parser.add_argument("--max-seq-len", type=int, default=2048, help="max sequence 
 parser.add_argument("--head-dim", type=int, default=128, help="head dimension")
 parser.add_argument("--base-dim", type=int, default=2048, help="original nanochat dimension")
 parser.add_argument("--expanded-dim", type=int, default=0, help="expanded model dimension (0=auto from checkpoint)")
+parser.add_argument("--vocab-size", type=int, default=0, help="vocab size (0=auto from checkpoint or model type)")
 
 # Matryoshka
 parser.add_argument("--matryoshka", action="store_true", help="enable Matryoshka training")
