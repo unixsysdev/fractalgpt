@@ -195,10 +195,10 @@ class MambaBlock(nn.Module):
 
     @torch.no_grad()
     def init_weights(self, std: float = 0.02):
-        """Initialize weights with small values, but out_proj to zeros for no-op start."""
+        """Initialize weights with small values, but out_proj and MLP output to zeros for no-op start."""
         for name, p in self.named_parameters():
-            if 'out_proj.weight' in name:
-                # Zero-init output projection so Mamba starts as no-op
+            if 'out_proj.weight' in name or 'mlp.2.weight' in name:
+                # Zero-init output projections so Mamba+MLP starts as no-op
                 nn.init.zeros_(p)
             elif 'weight' in name and p.dim() >= 2:
                 nn.init.normal_(p, mean=0.0, std=std)

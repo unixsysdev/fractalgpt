@@ -431,6 +431,11 @@ def build_hybrid_state_dict(
             dst_state[f"{mamba_prefix}.mamba.layer.D"] = torch.ones(d_inner)
             dst_state[f"{mamba_prefix}.mamba_norm.weight"] = torch.ones(hidden_size)
             
+            # MLP inside MambaBlock (also needs zero output for no-op)
+            mlp_inner = hidden_size * 4
+            dst_state[f"{mamba_prefix}.mlp.0.weight"] = torch.randn(mlp_inner, hidden_size) * std
+            dst_state[f"{mamba_prefix}.mlp.2.weight"] = torch.zeros(hidden_size, mlp_inner)  # Zero for no-op
+            
             block_idx += 1
             mamba_count += 1
         
