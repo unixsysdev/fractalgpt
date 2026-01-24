@@ -661,23 +661,17 @@ while step < args.num_iterations:
         **{f"train/{k}": v for k, v in metrics.items()},
     })
     
-    # Evaluation (skip Matryoshka dims in Phase 1 - not trained yet)
-    if args.eval_every > 0 and step > 0 and step % args.eval_every == 0:
+    # Evaluation (skip in Phase 1 with FSDP - orig_model is sharded)
+    if args.eval_every > 0 and step > 0 and step % args.eval_every == 0 and args.phase != 1:
         model.eval()
         with torch.no_grad(), autocast_ctx:
             eval_batch = next(train_loader)
             eval_x, eval_y = eval_batch[0], eval_batch[1]
-            # Phase 1: only eval at full dim (Matryoshka not trained)
-            if args.phase == 1:
-                eval_loss = orig_model(eval_x, eval_y)
-                print0(f"  Eval loss: {eval_loss.item():.4f}")
-                wandb_run.log({"eval/loss": eval_loss.item(), "step": step})
-            else:
-                # Phase 2+: eval at different dim levels
-                for dim in dim_levels:
-                    eval_loss = orig_model(eval_x, eval_y, active_dim=dim)
-                    print0(f"  Eval @ dim={dim}: {eval_loss.item():.4f}")
-                    wandb_run.log({f"eval/loss_dim_{dim}": eval_loss.item(), "step": step})
+            # Phase 2+: eval at different dim levels
+            for dim in dim_levels:
+                eval_loss = model(eval_x, eval_y, active_dim=dim)
+                print0(f"  Eval @ dim={dim}: {eval_loss.item():.4f}")
+                wandb_run.log({f"eval/loss_dim_{dim}": eval_loss.item(), "step": step})
         model.train()
     
     # Checkpointing
