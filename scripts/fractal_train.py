@@ -24,6 +24,10 @@ import random
 from pathlib import Path
 from contextlib import nullcontext
 
+# Auto-configure storage paths (finds mount with most space)
+from nanochat.storage import setup_storage
+storage_paths = setup_storage(quiet=False)
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -484,7 +488,9 @@ if args.compile and hasattr(torch, 'compile'):
 # Training loop
 print0("Starting training...")
 
-checkpoint_dir = Path.home() / ".cache/nanochat/fractal_checkpoints" / args.run
+# Use ADAMBA_CHECKPOINT_DIR env var if set (from setup_cache_paths.sh), else default
+checkpoint_base = Path(os.environ.get("ADAMBA_CHECKPOINT_DIR", Path.home() / ".cache/nanochat/fractal_checkpoints"))
+checkpoint_dir = checkpoint_base / args.run
 checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
 # Track checkpoints for rotation

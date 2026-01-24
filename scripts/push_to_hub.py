@@ -2,15 +2,16 @@
 """
 Push Adamba checkpoint to HuggingFace Hub.
 
-All versions go to the same repo with descriptive filenames:
-  - phase1_6b_base.pt
-  - phase2_6b_matryoshka.pt  
-  - phase3_9b_matryoshka.pt
-  - phase3_20b_matryoshka.pt
-  etc.
+Supports two repos:
+  - datasysdev/adamba: Original nanochat-based (6B-20B)
+  - datasysdev/gptoss-adamba: GPT-OSS 20B MoE based (22B+)
 
 Usage:
-    python scripts/push_to_hub.py --checkpoint path/to/model.pt --hf-token TOKEN --variant phase1_6b_base
+    # Original Adamba
+    python scripts/push_to_hub.py --checkpoint path/model.pt --hf-token TOKEN --variant phase1_6b_base
+    
+    # GPT-OSS Adamba (MoE)
+    python scripts/push_to_hub.py --checkpoint path/model.pt --hf-token TOKEN --variant gptoss_phase1 --repo-id gptoss-adamba
 """
 
 import argparse
@@ -22,23 +23,30 @@ from pathlib import Path
 
 # Model variants for the README
 VARIANTS = {
-    "phase1_6b_base": {"params": "6.4B", "dim": 2048, "features": ["mamba_integration"], "status": "training"},
-    "phase2_6b_matryoshka": {"params": "6.4B", "dim": 2048, "features": ["matryoshka", "early_exit"], "status": "pending"},
-    "phase3_9b_matryoshka": {"params": "9.3B", "dim": 2560, "features": ["matryoshka", "early_exit"], "status": "pending"},
-    "phase3_20b_matryoshka": {"params": "20B", "dim": 4096, "features": ["matryoshka", "early_exit"], "status": "pending"},
-    "sft_20b": {"params": "20B", "dim": 4096, "features": ["matryoshka", "early_exit", "sft"], "status": "pending"},
-    "rl_20b": {"params": "20B", "dim": 4096, "features": ["matryoshka", "early_exit", "rl_agent"], "status": "pending"},
+    # Original Adamba (nanochat-based)
+    "phase1_6b_base": {"params": "6.4B", "dim": 2048, "features": ["mamba_integration"], "status": "training", "base": "nanochat"},
+    "phase2_6b_matryoshka": {"params": "6.4B", "dim": 2048, "features": ["matryoshka", "early_exit"], "status": "pending", "base": "nanochat"},
+    "phase3_9b_matryoshka": {"params": "9.3B", "dim": 2560, "features": ["matryoshka", "early_exit"], "status": "pending", "base": "nanochat"},
+    "phase3_20b_matryoshka": {"params": "20B", "dim": 4096, "features": ["matryoshka", "early_exit"], "status": "pending", "base": "nanochat"},
+    "sft_20b": {"params": "20B", "dim": 4096, "features": ["matryoshka", "early_exit", "sft"], "status": "pending", "base": "nanochat"},
+    "rl_20b": {"params": "20B", "dim": 4096, "features": ["matryoshka", "early_exit", "rl_agent"], "status": "pending", "base": "nanochat"},
+    
+    # GPT-OSS Adamba (MoE-based, 22B)
+    "gptoss_phase1": {"params": "21.9B", "dim": 2880, "features": ["mamba_integration", "moe_32experts"], "status": "training", "base": "gpt-oss-20b"},
+    "gptoss_phase2": {"params": "21.9B", "dim": 2880, "features": ["matryoshka", "early_exit", "moe_32experts"], "status": "pending", "base": "gpt-oss-20b"},
+    "gptoss_phase3": {"params": "30B+", "dim": 4096, "features": ["matryoshka", "early_exit", "moe_32experts", "expansion"], "status": "pending", "base": "gpt-oss-20b"},
+    "gptoss_sft": {"params": "21.9B", "dim": 2880, "features": ["matryoshka", "moe_32experts", "sft"], "status": "pending", "base": "gpt-oss-20b"},
 }
 
 def main():
     parser = argparse.ArgumentParser(description="Push Adamba model to HuggingFace Hub")
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to model checkpoint")
     parser.add_argument("--hf-token", type=str, required=True, help="HuggingFace API token")
-    parser.add_argument("--repo-id", type=str, default="adamba", help="HuggingFace repo name")
+    parser.add_argument("--repo-id", type=str, default="adamba", help="HuggingFace repo name (adamba or gptoss-adamba)")
     parser.add_argument("--org", type=str, default="datasysdev", help="HuggingFace organization/username")
     parser.add_argument("--variant", type=str, default="phase1_6b_base", 
                         choices=list(VARIANTS.keys()),
-                        help="Model variant name")
+                        help="Model variant name (use gptoss_* variants for gptoss-adamba repo)")
     parser.add_argument("--private", action="store_true", help="Make repo private")
     parser.add_argument("--update-readme", action="store_true", help="Also update README with new variant")
     args = parser.parse_args()
@@ -81,15 +89,19 @@ def main():
     )
     
     # Upload config for this variant
+    is_gptoss = args.variant.startswith("gptoss_")
     config = {
         "variant": args.variant,
-        "model_type": "adamba-hybrid",
-        "architecture": "HybridGPT (Attention + Mamba)",
+        "model_type": "adamba-moe" if is_gptoss else "adamba-hybrid",
+        "architecture": "HybridMoEGPT (Attention + MoE + Mamba)" if is_gptoss else "HybridGPT (Attention + Mamba)",
+        "base_model": variant_info.get("base", "unknown"),
         "parameters": variant_info["params"],
         "n_embd": variant_info["dim"],
         "features": variant_info["features"],
-        "n_layers": 64,
-        "vocab_size": 65536,
+        "n_layers": 36 if is_gptoss else 64,  # 24 Attn + 12 Mamba for GPT-OSS
+        "vocab_size": 201088 if is_gptoss else 65536,
+        "num_experts": 32 if is_gptoss else None,
+        "experts_per_token": 4 if is_gptoss else None,
     }
     
     with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
@@ -123,9 +135,17 @@ def main():
 
 
 def generate_readme(current_variant):
+    is_gptoss = current_variant.startswith("gptoss_")
+    
+    # Filter variants for the current repo type
+    if is_gptoss:
+        filtered_variants = {k: v for k, v in VARIANTS.items() if k.startswith("gptoss_")}
+    else:
+        filtered_variants = {k: v for k, v in VARIANTS.items() if not k.startswith("gptoss_")}
+    
     # Build variant table
     variant_rows = []
-    for name, info in VARIANTS.items():
+    for name, info in filtered_variants.items():
         status = "✅" if name == current_variant else ("🔄" if info["status"] == "training" else "⏳")
         features = ", ".join(info["features"])
         link = f"[Download](./checkpoints/{name}.pt)" if name == current_variant else "—"
@@ -133,7 +153,76 @@ def generate_readme(current_variant):
     
     variant_table = "\n".join(variant_rows)
     
-    return f'''---
+    if is_gptoss:
+        return f'''---
+license: apache-2.0
+tags:
+- pytorch
+- transformer
+- mamba
+- moe
+- hybrid
+- matryoshka
+- gpt-oss
+- adaptive-compute
+pipeline_tag: text-generation
+---
+
+# 🌀 GPT-OSS Adamba: Hybrid MoE + Mamba
+
+> **21.9B** parameters | **32 experts** | **Mamba-enhanced** reasoning backbone
+
+📂 **[GitHub](https://github.com/unixsysdev/adamba)** | 🤗 **[Original Adamba](https://huggingface.co/datasysdev/adamba)**
+
+## Available Checkpoints
+
+| Variant | Parameters | Dim | Features | Status | Download |
+|---------|------------|-----|----------|--------|----------|
+{variant_table}
+
+## Architecture
+
+Built on [OpenAI GPT-OSS 20B](https://huggingface.co/openai/gpt-oss-20b) with Mamba integration:
+
+| Component | Spec |
+|-----------|------|
+| **Base Model** | GPT-OSS 20B MoE |
+| **Hidden Dim** | 2880 |
+| **Attention** | 24 layers (sliding + full alternating) |
+| **Mamba** | 12 layers (interleaved 2:1) |
+| **MoE** | 32 experts, top-4 routing |
+| **Vocab** | 201,088 tokens |
+| **Total Blocks** | 36 (24 Attn + 12 Mamba) |
+
+```
+┌─────────────────────────────────────────────────────┐
+│  GPT-OSS 20B (Attention + MoE)                       │
+│       ↓ Surgery (inject 12 Mamba layers)             │
+│  Hybrid: A-A-M-A-A-M-... pattern                     │
+│       ↓ Phase 1 (train Mamba only)                   │
+│  Mamba learns to "speak GPT-OSS language"            │
+│       ↓ Phase 2 (enable Matryoshka)                  │
+│  Adaptive compute: 128 → 2880 dim per layer          │
+└─────────────────────────────────────────────────────┘
+```
+
+## Training Status
+
+**Phase 1**: Mamba integration (freeze Attention+MoE, train Mamba)
+
+## Usage
+
+```python
+# Coming soon - inference code
+# See: https://github.com/unixsysdev/adamba
+```
+
+## License
+
+Apache 2.0 (same as GPT-OSS)
+'''
+    else:
+        return f'''---
 license: apache-2.0
 tags:
 - pytorch
@@ -150,7 +239,7 @@ pipeline_tag: text-generation
 
 > **Ad**aptive **Mamba**: Elastic compute with dynamic Matryoshka scaling
 
-📂 **[GitHub](https://github.com/unixsysdev/adamba)** | 🤗 **[HuggingFace](https://huggingface.co/datasysdev/adamba)**
+📂 **[GitHub](https://github.com/unixsysdev/adamba)** | 🤗 **[GPT-OSS Adamba](https://huggingface.co/datasysdev/gptoss-adamba)**
 
 ## Available Checkpoints
 
@@ -167,18 +256,6 @@ Adamba combines three efficiency techniques:
 | **Matryoshka (MRL)** | Width: 128 → 4096 per layer | Elastic compute |
 | **Early Exit** | ConfidenceGate per layer | Skip when confident |
 | **Static SSM** | Mamba at full dim | Stable memory backbone |
-
-```
-┌─────────────────────────────────────────────────┐
-│  PROMPT → LayerDimPredictor → [dim per layer]   │
-│                                                 │
-│  Attention + MLP: Dynamic (Matryoshka sliced)   │
-│  Mamba:           Static (full dim)             │
-│                                                 │
-│  Gate > 0.95 → EXIT EARLY                       │
-│  Gate < 0.50 → EXPAND remaining layers          │
-└─────────────────────────────────────────────────┘
-```
 
 ## Training Pipeline
 
@@ -200,7 +277,6 @@ RL:  Agent capabilities
 - **Base**: [karpathy/nanochat-d32](https://huggingface.co/karpathy/nanochat-d32)
 - **Architecture**: 64 blocks (32 Attention + 32 Mamba interleaved)
 - **Vocabulary**: 65,536 tokens  
-- **Matryoshka Dims**: [128, 256, 512, 1024, 2048, 4096]
 
 ## Usage
 
@@ -208,11 +284,6 @@ RL:  Agent capabilities
 # Coming soon - inference code
 # See: https://github.com/unixsysdev/adamba
 ```
-
-## Links
-
-- 📂 **GitHub**: [unixsysdev/adamba](https://github.com/unixsysdev/adamba)
-- 📊 **Training**: [WandB](https://wandb.ai/dalletest123/nano-fractal)
 
 ## License
 

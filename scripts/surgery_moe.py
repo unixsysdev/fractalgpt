@@ -2,16 +2,18 @@
 Surgery script for GPT-OSS 20B checkpoint conversion.
 
 Converts HuggingFace GPT-OSS 20B checkpoint to Adamba hybrid format:
-1. Maps GPT-OSS weight names to Adamba naming convention
-2. Injects zero-initialized Mamba layers between attention blocks
-3. Adds Matryoshka infrastructure (probes, gates)
+1. Auto-downloads GPT-OSS from HuggingFace (or uses provided path)
+2. Auto-detects mount with most storage space
+3. Maps weight names to Adamba naming convention
+4. Injects zero-initialized Mamba layers between attention blocks
+5. Adds Matryoshka infrastructure (probes, gates)
 
 Usage:
-    # Download checkpoint first:
-    huggingface-cli download openai/gpt-oss-20b --include "original/*" --local-dir gpt-oss-20b/
+    # Zero-config (auto-downloads + smart storage):
+    python -m scripts.surgery_moe
     
-    # Convert:
-    python -m scripts.surgery_moe --src gpt-oss-20b/original --dst checkpoints/gptoss_hybrid.pt
+    # Manual paths (if you already have the checkpoint):
+    python -m scripts.surgery_moe --src /path/to/gpt-oss-20b --dst /path/to/output.pt
 """
 
 import argparse
@@ -23,7 +25,44 @@ from typing import Dict, Optional
 import torch
 import torch.nn as nn
 
+# Auto-configure storage paths
+from nanochat.storage import setup_storage
+storage_paths = setup_storage(quiet=True)
+
 from nanochat.moe_block import MoEConfig
+
+
+# HuggingFace model ID
+GPTOSS_HF_REPO = "openai/gpt-oss-20b"
+
+
+def download_gptoss_if_needed() -> Path:
+    """Download GPT-OSS from HuggingFace if not already cached."""
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        print("Installing huggingface_hub...")
+        import subprocess
+        subprocess.run(["pip", "install", "huggingface_hub"], check=True)
+        from huggingface_hub import snapshot_download
+    
+    print(f"📥 Checking for GPT-OSS 20B at HuggingFace...")
+    
+    # Download to our smart storage location
+    local_dir = storage_paths.huggingface / "gpt-oss-20b"
+    
+    try:
+        path = snapshot_download(
+            repo_id=GPTOSS_HF_REPO,
+            local_dir=str(local_dir),
+            local_dir_use_symlinks=False,
+        )
+        print(f"✅ GPT-OSS 20B ready at: {path}")
+        return Path(path)
+    except Exception as e:
+        print(f"❌ Failed to download: {e}")
+        raise
+
 
 
 # GPT-OSS 20B config (from HuggingFace)
@@ -288,6 +327,13 @@ def build_hybrid_state_dict(
                 deq = (blocks.view(-1) * expanded_scales.view(-1)).view(B_shape)
             else:
                 deq = blocks * expanded_scales
+            
+            # CRITICAL: Flatten to 3D if we have 4D block structure
+            # [experts, dim1, num_blocks, block_size] -> [experts, dim1, dim2]
+            # MoELayer expects [32, 5760, 2880] not [32, 5760, 90, 32]
+            if deq.dim() == 4:
+                experts, dim1, num_blocks, block_size = deq.shape
+                deq = deq.view(experts, dim1, num_blocks * block_size)
                 
             return deq.to(torch.bfloat16)
 
@@ -453,13 +499,13 @@ def surgery_moe(
 def main():
     parser = argparse.ArgumentParser(description="Convert GPT-OSS 20B to Adamba hybrid")
     parser.add_argument(
-        "--src", type=Path, required=True,
-        help="Path to GPT-OSS checkpoint directory (containing safetensor files)"
+        "--src", type=Path, default=None,
+        help="Path to GPT-OSS checkpoint directory (auto-downloads if not provided)"
     )
     parser.add_argument(
         "--dst", type=Path, 
-        default=Path.home() / ".cache/nanochat/gptoss_hybrid/model.pt",
-        help="Output checkpoint path"
+        default=None,  # Will use storage_paths.surgery
+        help="Output checkpoint path (default: auto-detected best storage)"
     )
     parser.add_argument(
         "--n-mamba", type=int, default=12,
@@ -467,6 +513,16 @@ def main():
     )
     
     args = parser.parse_args()
+    
+    # Auto-download GPT-OSS if source not provided
+    if args.src is None:
+        args.src = download_gptoss_if_needed()
+    
+    # Use smart storage for output if not specified
+    if args.dst is None:
+        args.dst = storage_paths.surgery / "gptoss_hybrid.pt"
+        print(f"📁 Output: {args.dst}")
+    
     surgery_moe(args.src, args.dst, args.n_mamba)
 
 
