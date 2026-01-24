@@ -1075,14 +1075,15 @@ class GptOssBlock(nn.Module):
         B, T, C = x.size()
         
         # Compute RoPE embeddings (cos, sin) for this sequence
+        # Shape: [1, T, 1, head_dim//2] for broadcasting over batch and heads
         device = x.device
         head_dim = self.attn.head_dim
         theta = 10000.0
         freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
         pos = torch.arange(T, device=device)
         angles = pos.unsqueeze(1) * freqs.unsqueeze(0)  # [T, head_dim//2]
-        cos = torch.cos(angles).unsqueeze(0)  # [1, T, head_dim//2]
-        sin = torch.sin(angles).unsqueeze(0)  # [1, T, head_dim//2]
+        cos = torch.cos(angles).unsqueeze(0).unsqueeze(2)  # [1, T, 1, head_dim//2]
+        sin = torch.sin(angles).unsqueeze(0).unsqueeze(2)  # [1, T, 1, head_dim//2]
         cos_sin = (cos, sin)
         
         # Window size for sliding window attention (use full attention for GPT-OSS)
