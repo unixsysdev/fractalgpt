@@ -320,13 +320,17 @@ from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer
 
 # Define wrapping policy
 def get_fsdp_policy(model_type):
-    from nanochat.hybrid_gpt import HybridBlock
+    from nanochat.hybrid_gpt import HybridBlock, GptOssBlock
     from nanochat.moe_block import MoEBlock
+    from nanochat.mamba_block import MambaBlock
     
-    # Wrap each transformer block
+    # Wrap each transformer/mamba block individually for fine-grained sharding
+    # This reduces the size of each flat_param, avoiding OOM during flattening
     transformer_layer_cls = {
         HybridBlock,
         MoEBlock,
+        GptOssBlock,
+        MambaBlock,
     }
     
     # Use **kwargs for compatibility with different PyTorch versions
