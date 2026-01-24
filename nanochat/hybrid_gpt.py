@@ -1072,10 +1072,26 @@ class GptOssBlock(nn.Module):
         self.moe = MoELayer(moe_config)
         
     def forward(self, x, active_dim=None):
+        B, T, C = x.size()
+        
+        # Compute RoPE embeddings (cos, sin) for this sequence
+        device = x.device
+        head_dim = self.attn.head_dim
+        theta = 10000.0
+        freqs = 1.0 / (theta ** (torch.arange(0, head_dim, 2, device=device).float() / head_dim))
+        pos = torch.arange(T, device=device)
+        angles = pos.unsqueeze(1) * freqs.unsqueeze(0)  # [T, head_dim//2]
+        cos = torch.cos(angles).unsqueeze(0)  # [1, T, head_dim//2]
+        sin = torch.sin(angles).unsqueeze(0)  # [1, T, head_dim//2]
+        cos_sin = (cos, sin)
+        
+        # Window size for sliding window attention (use full attention for GPT-OSS)
+        window_size = (-1, -1)  # -1 means full attention
+        
         # Attention
         resid = x
         h = self.attn_norm(x)
-        h = self.attn(h, active_dim=active_dim)
+        h = self.attn(h, ve=None, cos_sin=cos_sin, window_size=window_size, active_dim=active_dim)
         x = resid + h
         
         # MoE
