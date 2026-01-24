@@ -229,26 +229,49 @@ def build_hybrid_state_dict(
             blocks = src_state[blocks_key] # (..., block_size)
             scales = src_state[scales_key] # (..., 1)
             
-            # Basic block dequantization: blocks * scales
-            # Assuming block_size is the last dim or inferred
-            # Blocks usually int8/uint8. Scales bf16/float.
+            # 4-BIT PACKING CHECK:
+            # If the last dimension is exactly half of what we expect (based on other dims or logic),
+            # it means we have 4-bit elements packed into uint8.
+            # GPT-OSS expert shapes: 
+            # GateUp expected: [32, 5760, 2880]. Packed: [32, 5760, 1440]?
+            # Down expected:   [32, 2880, 2880]. Packed: [32, 2880, 1440]?
             
-            # Expand scales to match blocks
-            # If blocks is [N, K], scales is [N, K/block_size] ? 
-            # OR blocks is active tensor, scales is per-block.
-            # MXFP4 often: blocks [N, K], scales [N, K/32]
-            
+            if blocks.dtype == torch.uint8:
+                 # Check for 4-bit packing: heuristic or forceful?
+                 # Let's assume ALWAYS unpacked if it's MXFP4? No, inspecting shape is safer.
+                 # But we don't know expected shape here easily. 
+                 # However, MXFP4 is almost always 4-bit.
+                 
+                 # Unpack 4-bit:
+                 # x_low = x & 0x0F
+                 # x_high = (x >> 4) & 0x0F
+                 # Elements are likely [e0, e1] in one byte.
+                 
+                 # Note: "blocks" is [..., K/2]. We want [..., K].
+                 # We need to interleave or concat. 
+                 # Often: [low, high] or [e0, e1].
+                 
+                 # Unpack
+                 b_low = blocks & 0x0F
+                 b_high = (blocks >> 4) & 0x0F
+                 
+                 # Stack and flatten last dim to double it
+                 # (..., K/2) -> (..., K/2, 2) -> (..., K)
+                 unpacked = torch.stack([b_low, b_high], dim=-1).view(*blocks.shape[:-1], -1)
+                 
+                 # Cast to signed centered? 
+                 # MXFP4 typical format: E2M1? Or integer?
+                 # Assuming simple int scaling for now: (x - 8) or similar? 
+                 # Actually, usually it's just raw integer to be scaled.
+                 # Let's treat as float.
+                 blocks = unpacked.float()
+                 
+            elif blocks.dtype in [torch.int8]:
+                 blocks = blocks.float()
+
             B_shape = blocks.shape
             S_shape = scales.shape
             
-            # Auto-detect block size
-            # Usually strict division
-            # E.g. [32, 5632, 2880] elements vs scales
-            
-            if blocks.dtype in [torch.int8, torch.uint8]:
-                # Cast to float for math
-                blocks = blocks.float()
-                
             # Repeat scales
             # Calculate repetition factor
             # Simple assumption: flatten and verify ratio
@@ -257,16 +280,11 @@ def build_hybrid_state_dict(
             block_size = total_elements // total_scales
             
             # Reshape scales to repeat
-            # This is heuristic. Real MXFP4 might need specific layout.
-            # Assuming contiguous blocks in last dim?
-            # Or flattening everything?
-            
-            # Safe approach: Upsample scales
+            # This is heuristic.
             expanded_scales = scales.repeat_interleave(block_size, dim=-1)
             
             # In case dimensions don't match after flatten logic
             if expanded_scales.shape != blocks.shape:
-                # Try reshaping active to 1D, scales to 1D, mul, reshape back
                 deq = (blocks.view(-1) * expanded_scales.view(-1)).view(B_shape)
             else:
                 deq = blocks * expanded_scales
