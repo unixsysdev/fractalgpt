@@ -1018,9 +1018,13 @@ class HybridMoEGPT(nn.Module):
                 target_dim = self.config.mlp_dim_levels[level_idx]
             
             # Forward block with optional checkpointing
+            # Note: isinstance(block, GptOssBlock) fails with FSDP wrapping
+            # Use hasattr to detect block type (GptOssBlock has 'moe', MambaBlock doesn't)
+            is_moe_block = hasattr(block, 'moe') or (hasattr(block, 'module') and hasattr(block.module, 'moe'))
+            
             if self.gradient_checkpointing and self.training:
                 from torch.utils.checkpoint import checkpoint
-                if isinstance(block, GptOssBlock):
+                if is_moe_block:
                     def create_custom_forward(module):
                         def custom_forward(x, dim):
                             return module(x, active_dim=dim)
@@ -1030,9 +1034,9 @@ class HybridMoEGPT(nn.Module):
                 else:
                     x = checkpoint(block, x, use_reentrant=False)
             else:
+                # If MoE block: x + aux_loss
                 # If Mamba: just x
-                # If GPT-OSS: x + aux_loss
-                if isinstance(block, GptOssBlock):
+                if is_moe_block:
                     x, aux_loss = block(x, active_dim=target_dim)
                     total_aux_loss += aux_loss
                 else:
