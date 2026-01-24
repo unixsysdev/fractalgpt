@@ -498,7 +498,8 @@ def synthetic_data_loader():
 # Use synthetic data for testing, real data for actual training
 try:
     tokenizer = get_tokenizer()
-    token_bytes = get_token_bytes(device=device)
+    # Note: token_bytes is only needed for BPB evaluation, not training
+    # Skip it here to allow training even without tok_train.py having been run
     train_loader = tokenizing_distributed_data_loader_bos_bestfit(
         tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device
     )
