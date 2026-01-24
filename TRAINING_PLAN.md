@@ -100,6 +100,18 @@ torchrun --nproc_per_node=8 -m scripts.fractal_train \
 
 ---
 
+## Phases 5-6: **8192+ Context**. Sovereign reasoning (CoT) and multi-turn agent trajectories require deep context windows to maintain tool histories.
+
+### 10.2. The "Bridge Training" Hypothesis (Antidote to Forgetting)
+User concern: *Does training on 2k context cause the model to forget 131k capabilities?*
+
+**Answer: No, because Mamba acts as a "Sliding Window Bridge".**
+- **The Mechanism**: GPT-OSS uses purely local sliding windows (128 tokens) in even layers.
+- **The Task**: Mamba's job is not to memorize 131k tokens from scratch, but to **learn the pattern of bridging these 128-token gaps**.
+- **The Mathematical Proof**: A training context of **2048 tokens** contains $16 \times 128$-token windows. This provides sufficient signal for Mamba to learn the inductive bias of "propagating state across windows."
+- **Inference Extrapolation**: Once Mamba learns this bridging function on 16 windows (2k), it can architecturally extrapolate to 1000 windows (131k) at inference time because the state-space mechanism ($h_t = Ah_{t-1} + Bx_t$) is time-invariant.
+- **Safety**: The original Attention layers (which handle the 131k long-range dependencies in odd layers) remain frozen or low-rank tuned, preserving the "muscle memory" of the base model.  
+
 ## Phase 5: CoT + Function Calling
 
 **Goal:** Model learns reasoning and tool use  

@@ -40,7 +40,6 @@ from nanochat.common import (
 )
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
-from nanochat.hybrid_gpt import HybridGPT, HybridConfig
 from nanochat.matryoshka import (
     MLP_DIM_LEVELS, sample_dim_level, compute_energy_penalty,
 )
@@ -105,6 +104,7 @@ parser.add_argument("--compile-mode", type=str, default="reduce-overhead",
                     help="torch.compile mode")
 parser.add_argument("--no-muon", action="store_true", help="disable Muon optimizer (use AdamW only, saves memory)")
 parser.add_argument("--gradient-checkpointing", action="store_true", help="use gradient checkpointing (saves ~50%% memory)")
+parser.add_argument("--model-type", type=str, default="nanochat", help="model variant (nanochat|gptoss)")
 
 args = parser.parse_args()
 
@@ -156,22 +156,57 @@ print0(f"Matryoshka dim levels: {dim_levels}")
 # Model setup
 print0("Setting up model...")
 
-# Create config
-config = HybridConfig(
-    sequence_len=args.max_seq_len,
-    vocab_size=65536,  # nanochat uses 64K vocab
-    n_layer=args.depth,
-    n_mamba_layer=args.n_mamba,
-    n_head=expanded_dim // args.head_dim,
-    n_kv_head=expanded_dim // args.head_dim,
-    n_embd=args.base_dim,
-    n_embd_expanded=expanded_dim,
-    mlp_dim_levels=dim_levels,
-)
+# Determine vocab size
+vocab_size = args.vocab_size
+if vocab_size == 0: # If not specified by argument
+    if checkpoint_config and "vocab_size" in checkpoint_config:
+        vocab_size = checkpoint_config["vocab_size"]
+        print0(f"Using vocab size from checkpoint config: {vocab_size}")
+    else:
+        vocab_size = 65536 # Default for nanochat
+        print0(f"Using default nanochat vocab size: {vocab_size}")
 
-# Create model
-with torch.device("meta"):
-    model = HybridGPT(config)
+if args.model_type == "gptoss" and vocab_size == 65536:
+    # Override for GPT-OSS if default nanochat vocab size was used
+    vocab_size = 201088
+    print0(f"Overriding to GPT-OSS default vocab size: {vocab_size}")
+
+# Create config and model based on type
+if args.model_type == "gptoss":
+    print0("Initializing GPT-OSS 20B MoE model architecture...")
+    # Map CLI args to MoE config
+    config = GptOssMoEConfig(
+        vocab_size=vocab_size,
+        num_hidden_layers=args.depth, # Should be 24 for GPT-OSS
+        n_mamba_layers=args.n_mamba,  # Should be 12
+        num_attention_heads=64,       # Fixed for GPT-OSS 20B
+        num_key_value_heads=8,        # Fixed
+        head_dim=64,                  # Fixed
+        num_experts=32,
+        experts_per_token=4,
+        mlp_dim_levels=dim_levels,    # Use our Matryoshka levels
+    )
+    
+    with torch.device("meta"):
+        model = HybridMoEGPT(config)
+        
+else:
+    # Standard NanoChat config
+    config = HybridConfig(
+        sequence_len=args.max_seq_len,
+        vocab_size=vocab_size,
+        n_layer=args.depth,
+        n_mamba_layer=args.n_mamba,
+        n_head=expanded_dim // args.head_dim,
+        n_kv_head=expanded_dim // args.head_dim,
+        n_embd=args.base_dim,
+        n_embd_expanded=expanded_dim,
+        mlp_dim_levels=dim_levels,
+    )
+
+    # Create model
+    with torch.device("meta"):
+        model = HybridGPT(config)
 
 # Materialize on device
 model = model.to_empty(device=device)
@@ -210,8 +245,53 @@ else:
     model.init_weights()
 
 # Wrap in DDP if needed
+# FSDP Setup
+from torch.distributed.fsdp import (
+    FullyShardedDataParallel as FSDP,
+    MixedPrecision,
+    BackwardPrefetch,
+    ShardingStrategy,
+    CPUOffload,
+)
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
+
+# Define wrapping policy
+def get_fsdp_policy(model_type):
+    from nanochat.hybrid_gpt import HybridBlock
+    from nanochat.moe_block import MoEBlock
+    
+    # Wrap each transformer block
+    transformer_layer_cls = {
+        HybridBlock,
+        MoEBlock,
+    }
+    
+    return lambda module, recurse, nonwrapped_child_numel: transformer_auto_wrap_policy(
+        module, recurse, nonwrapped_child_numel, transformer_layer_cls=transformer_layer_cls
+    )
+
 if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+    print0("Wrapping model with FSDP...")
+    
+    # Mixed precision policy (keep params in LP, grads in LP, buffers in FP32)
+    # Using BF16 for everything if available
+    mp_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.float32,
+    )
+
+    model = FSDP(
+        model,
+        auto_wrap_policy=get_fsdp_policy(args.model_type),
+        mixed_precision=mp_policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD, # Shard model + optimizer + grads
+        device_id=torch.cuda.current_device(),
+        limit_all_gathers=True,
+        use_orig_params=True, # Needed for torch.compile
+    )
+    
+    print0(f"FSDP wrapping complete. Sharding strategy: FULL_SHARD")
 orig_model = model.module if ddp else model
 
 num_params = sum(p.numel() for p in model.parameters())
@@ -233,28 +313,38 @@ if args.phase == 1:
     for name, param in orig_model.named_parameters():
         should_train = False
         
-        # Mamba layers (odd blocks) should train
+    # Phase 1: Freeze everything except Mamba
+    print0("Phase 1: Freezing Attention/MoE, Training Mamba only")
+    for name, p in orig_model.named_parameters():
+        p.requires_grad = False
+        
+        # Check if this is a Mamba layer
+        # Naming convention: blocks.X.mamba... OR blocks.X.mlp... (if block X is Mamba)
+        if "mamba" in name:
+            p.requires_grad = True # The actual Mamba SSM
+        
+        # Critical Fix: Unfreeze everything inside Mamba blocks (including norms)
+        # Mamba blocks are at indices 2, 5, 8... in the 2:1 interleave pattern (A, A, M)
+        # Formula: (block_id + 1) % 3 == 0  => block_id % 3 == 2
         if "blocks." in name:
             try:
-                parts = name.split('.')
-                block_idx = int(parts[1]) if parts[0] == "blocks" else int(parts[2])
-                if block_idx % 2 == 1:  # Odd = Mamba
-                    should_train = True
+                parts = name.split('.') 
+                # name is like blocks.2.norm.weight
+                block_id = int(parts[1])
+                if block_id % 3 == 2: # Indices 2, 5, 8... are Mamba
+                     p.requires_grad = True
             except (ValueError, IndexError):
                 pass
         
-        # Gates and dim_predictor should NOT train in Phase 1
-        if "gate" in name or "dim_predictor" in name:
-            should_train = False
-        
-        param.requires_grad = should_train
-        if should_train:
-            trainable_count += 1
-        else:
-            frozen_count += 1
-    
-    print0(f"  ❄️  Frozen: {frozen_count} tensors")
-    print0(f"  🔥 Trainable: {trainable_count} tensors")
+        # Also unfreeze explicit learnable scalars if they exist
+        if "lambdas" in name:
+            p.requires_grad = True
+            
+    # Verify freezing
+    trainable = [n for n, p in orig_model.named_parameters() if p.requires_grad]
+    frozen = [n for n, p in orig_model.named_parameters() if not p.requires_grad]
+    print0(f"  ❄️  Frozen: {len(frozen)} tensors")
+    print0(f"  🔥 Trainable: {len(trainable)} tensors")
     
     # Force disable Matryoshka for Phase 1
     args.matryoshka = False

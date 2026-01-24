@@ -174,47 +174,84 @@ class MoELayer(nn.Module):
         active_dim: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Forward pass through MoE layer.
+        Forward pass through MoE layer using sequential expert execution.
         
-        Args:
-            hidden_states: (batch, seq, hidden)
-            active_dim: Optional Matryoshka dimension (not used in MoE, kept for interface)
-            
-        Returns:
-            output: (batch, seq, hidden)
-            aux_loss: scalar load balancing loss
+        Avoids materializing (batch, seq, k, hidden, inter) tensors which causes OOM.
         """
         batch, seq, hidden = hidden_states.shape
+        num_tokens = batch * seq
+        
+        # Flatten input
+        flat_hidden = hidden_states.view(num_tokens, hidden)
         
         # Get routing decisions
-        expert_weights, expert_indices, aux_loss = self.router(hidden_states)
         # expert_weights: (batch, seq, k)
         # expert_indices: (batch, seq, k)
+        expert_weights, expert_indices, aux_loss = self.router(hidden_states)
         
-        # Gather expert weights for selected experts
-        # This is the "naive" implementation - production would use scatter/gather
-        mlp1_w = self.mlp1_weight[expert_indices]  # (batch, seq, k, 2*inter, hidden)
-        mlp1_b = self.mlp1_bias[expert_indices]    # (batch, seq, k, 2*inter)
-        mlp2_w = self.mlp2_weight[expert_indices]  # (batch, seq, k, hidden, inter)
-        mlp2_b = self.mlp2_bias[expert_indices]    # (batch, seq, k, hidden)
+        # Flatten routing info
+        flat_indices = expert_indices.view(num_tokens, self.experts_per_token)
+        flat_weights = expert_weights.view(num_tokens, self.experts_per_token)
         
-        # Expand hidden states for k experts
-        h = hidden_states.unsqueeze(2)  # (batch, seq, 1, hidden)
+        # Prepare output buffer
+        final_output = torch.zeros_like(flat_hidden)
         
-        # MLP1: project up
-        # (batch, seq, k, 2*inter, hidden) @ (batch, seq, k, hidden, 1) -> (batch, seq, k, 2*inter)
-        h1 = torch.einsum('bskoh,bskh->bsko', mlp1_w, h.expand(-1, -1, self.experts_per_token, -1))
-        h1 = h1 + mlp1_b
-        
-        # SwiGLU activation
-        h1 = swiglu(h1, limit=self.swiglu_limit)  # (batch, seq, k, inter)
-        
-        # MLP2: project down
-        h2 = torch.einsum('bskho,bsko->bskh', mlp2_w, h1)
-        h2 = h2 + mlp2_b  # (batch, seq, k, hidden)
-        
-        # Weighted sum of expert outputs
-        output = torch.einsum('bskh,bsk->bsh', h2, expert_weights)
+        # Sequential expert execution (loop over experts 0..31)
+        # This is slower than custom kernels (e.g. megablocks) but OOM-safe
+        for expert_idx in range(self.num_experts):
+            # Find tokens routed to this expert (can be multiple times per token?)
+            # Actually for Top-K each expert appears at most once per token usually
+            # But let's handle the mask properly
+            
+            # Mask: (num_tokens, k) boolean
+            expert_mask = (flat_indices == expert_idx)
+            
+            # Which tokens send to this expert? (num_tokens,) boolean
+            token_mask = expert_mask.any(dim=1)
+            
+            if not token_mask.any():
+                continue
+                
+            # Gather tokens for this expert
+            # (num_active_tokens, hidden)
+            active_tokens = flat_hidden[token_mask]
+            
+            # Forward pass through this expert
+            # 1. MLP1 (SwiGLU)
+            # Weights: (2*inter, hidden) separate from stacked param
+            w1 = self.mlp1_weight[expert_idx]
+            b1 = self.mlp1_bias[expert_idx]
+            
+            h1 = F.linear(active_tokens, w1, b1)
+            h1 = swiglu(h1, limit=self.swiglu_limit)
+            
+            # 2. MLP2
+            w2 = self.mlp2_weight[expert_idx]
+            b2 = self.mlp2_bias[expert_idx]
+            
+            expert_out = F.linear(h1, w2, b2)  # (num_active_tokens, hidden)
+            
+            # Scatter back to output based on weights
+            # We need to multiply by the routing weight for this expert
+            # Get weights for these tokens for this expert: (num_active_tokens,)
+            # Note: A token might select expert X as its 1st choice or 2nd choice...
+            # We need the weight corresponding to WHERE it was selected
+            
+            # Extract weights: mask gives us positions in (num_tokens, k)
+            # We select values where mask is True
+            active_weights = flat_weights[expert_mask] 
+            
+            # Weighted output
+            weighted_out = expert_out * active_weights.unsqueeze(1)
+            
+            # Add to final buffer
+            # final_output[token_mask] += weighted_out  <-- This would fail if token selects expert multiple times (rare)
+            # Safe add: scatter_add
+            indices = torch.nonzero(token_mask).squeeze(1)
+            final_output.index_add_(0, indices, weighted_out)
+            
+        # Reshape to (batch, seq, hidden)
+        output = final_output.view(batch, seq, hidden)
         
         return output, aux_loss
 

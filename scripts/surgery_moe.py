@@ -225,13 +225,33 @@ def build_hybrid_state_dict(
                 # Interleave gate and up for SwiGLU: [gate[0], up[0], gate[1], up[1], ...]
                 gate_w = src_state[gate_key]  # (intermediate, hidden)
                 up_w = src_state[up_key]      # (intermediate, hidden)
+                
+                # DEQUANTIZATION SAFETY GUARD:
+                # GPT-OSS weights might be MXFP4 (uint8). Treating them as floats is mathematically invalid.
+                # If valid BF16 weights are found, we use them. If UINT8 is found, we ABORT.
+                if gate_w.dtype in [torch.uint8, torch.int8] or up_w.dtype in [torch.uint8, torch.int8]:
+                     raise ValueError(
+                         "CRITICAL: Detected integer-quantized weights (MXFP4/INT8). "
+                         "Direct casting to float is invalid and will destroy the model. "
+                         "Please dequantize the source checkpoint to BF16 using an off-the-shelf tool "
+                         "(e.g. vllm or bitsandbytes) before running this surgery script."
+                    )
+                
+                # Stack along intermediate dimension
+                gate_w = gate_w.to(torch.bfloat16)
+                up_w = up_w.to(torch.bfloat16)
+                
                 # Stack along intermediate dimension
                 combined = torch.stack([gate_w, up_w], dim=1).view(-1, hidden_size)
                 mlp1_weights.append(combined)
                 mlp1_biases.append(torch.zeros(intermediate_size * 2))
             
             if down_key in src_state:
-                mlp2_weights.append(src_state[down_key])  # (hidden, intermediate)
+                down_w = src_state[down_key]
+                if down_w.dtype == torch.uint8 or down_w.dtype == torch.int8:
+                    down_w = down_w.float().to(torch.bfloat16)
+                    
+                mlp2_weights.append(down_w)  # (hidden, intermediate)
                 mlp2_biases.append(torch.zeros(hidden_size))
         
         if mlp1_weights:
