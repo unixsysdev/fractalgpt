@@ -421,15 +421,19 @@ def build_hybrid_state_dict(
             mamba_prefix = f"blocks.{block_idx}"
             
             # Initialize Mamba with zero output projection (no-op start)
-            dst_state[f"{mamba_prefix}.mamba.layer.in_proj.weight"] = torch.randn(d_inner * 2, hidden_size) * std
-            dst_state[f"{mamba_prefix}.mamba.layer.out_proj.weight"] = torch.zeros(hidden_size, d_inner)
-            dst_state[f"{mamba_prefix}.mamba.layer.conv1d.weight"] = torch.randn(d_inner, 1, d_conv) * std
-            dst_state[f"{mamba_prefix}.mamba.layer.conv1d.bias"] = torch.zeros(d_inner)
-            dst_state[f"{mamba_prefix}.mamba.layer.dt_proj.weight"] = torch.randn(d_inner, d_inner) * std
-            dst_state[f"{mamba_prefix}.mamba.layer.dt_proj.bias"] = torch.zeros(d_inner)
-            dst_state[f"{mamba_prefix}.mamba.layer.A_log"] = torch.zeros(d_inner, d_state)
-            dst_state[f"{mamba_prefix}.mamba.layer.D"] = torch.ones(d_inner)
-            dst_state[f"{mamba_prefix}.mamba_norm.weight"] = torch.ones(hidden_size)
+            # Note: mamba-ssm Mamba class has keys directly (no .layer. prefix)
+            import math
+            dt_rank = math.ceil(hidden_size / 16)  # mamba-ssm default
+            
+            dst_state[f"{mamba_prefix}.mamba.in_proj.weight"] = torch.randn(d_inner * 2, hidden_size) * std
+            dst_state[f"{mamba_prefix}.mamba.out_proj.weight"] = torch.zeros(hidden_size, d_inner)  # Zero for no-op
+            dst_state[f"{mamba_prefix}.mamba.conv1d.weight"] = torch.randn(d_inner, 1, d_conv) * std
+            dst_state[f"{mamba_prefix}.mamba.conv1d.bias"] = torch.zeros(d_inner)
+            dst_state[f"{mamba_prefix}.mamba.x_proj.weight"] = torch.randn(dt_rank + d_state * 2, d_inner) * std
+            dst_state[f"{mamba_prefix}.mamba.dt_proj.weight"] = torch.randn(d_inner, dt_rank) * std
+            dst_state[f"{mamba_prefix}.mamba.dt_proj.bias"] = torch.zeros(d_inner)
+            dst_state[f"{mamba_prefix}.mamba.A_log"] = torch.zeros(d_inner, d_state)
+            dst_state[f"{mamba_prefix}.mamba.D"] = torch.ones(d_inner)
             
             # MLP inside MambaBlock (also needs zero output for no-op)
             mlp_inner = hidden_size * 4
