@@ -244,6 +244,9 @@ class MoELayer(nn.Module):
             # Weighted output
             weighted_out = expert_out * active_weights.unsqueeze(1)
             
+            # Cast to destination dtype if needed (e.g. float32 -> bfloat16)
+            weighted_out = weighted_out.to(final_output.dtype)
+            
             # Add to final buffer
             # final_output[token_mask] += weighted_out  <-- This would fail if token selects expert multiple times (rare)
             # Safe add: scatter_add
