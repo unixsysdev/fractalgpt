@@ -674,14 +674,10 @@ while step < args.num_iterations:
                 wandb_run.log({f"eval/loss_dim_{dim}": eval_loss.item(), "step": step})
         model.train()
     
-    # Checkpointing
+    # Checkpointing - save only once to persistent storage
     if args.save_every > 0 and step > 0 and step % args.save_every == 0:
         if master_process:
-            ckpt_path = checkpoint_dir / f"model_{step:06d}.pt"
-            torch.save(orig_model.state_dict(), ckpt_path)
-            saved_checkpoints.append(ckpt_path)
-            
-            # Backup latest to separate volume (survives machine failure)
+            # Save to persistent backup storage only (no double save)
             backup_dir = Path("/mnt/pt/adamba_checkpoints")
             backup_dir.mkdir(parents=True, exist_ok=True)
             backup_path = backup_dir / "latest_checkpoint.pt"
@@ -694,22 +690,21 @@ while step < args.num_iterations:
                     old_ckpt.unlink()
                     print0(f"  Deleted old checkpoint: {old_ckpt.name}")
             
-            # Save config
-            config_path = checkpoint_dir / "config.json"
+            # Save config (use correct attr names for different model types)
+            config_path = backup_dir / "config.json"
+            n_layers = getattr(config, 'num_layers', getattr(config, 'n_layer', 24))
+            n_mamba = getattr(config, 'num_mamba_layers', getattr(config, 'n_mamba_layer', 12))
+            n_embd = getattr(config, 'hidden_size', getattr(config, 'n_embd_expanded', 2048))
             with open(config_path, "w") as f:
                 json.dump({
-                    "n_layer": config.n_layer,
-                    "n_mamba_layer": config.n_mamba_layer,
-                    "n_embd_expanded": config.n_embd_expanded,
+                    "n_layer": n_layers,
+                    "n_mamba_layer": n_mamba,
+                    "n_embd_expanded": n_embd,
                     "dim_levels": dim_levels,
                     "step": step,
                 }, f)
             
-            # Also copy config to backup
-            import shutil
-            shutil.copy(config_path, backup_dir / "config.json")
-            
-            print0(f"Saved checkpoint: {ckpt_path} + backup")
+            print0(f"Saved checkpoint: {backup_path}")
     
     step += 1
 
