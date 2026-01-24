@@ -281,6 +281,12 @@ def build_hybrid_state_dict(
             gate_up_w = load_quantized(gate_up_key, gate_up_scale) # (32, 5760, 2880) ?
             down_w = load_quantized(down_key, down_scale)         # (32, 2880, 2880) ?
             
+            # DEBUG: Print shapes for first layer
+            if layer_idx == 0:
+                print(f"DEBUG: Layer {layer_idx} Expert Shapes:")
+                print(f"  GateUp: {gate_up_w.shape} (Expected dim1 = {intermediate_size*2})")
+                print(f"  Down:   {down_w.shape} (Expected dim1 = {intermediate_size}?? Check transpose)")
+            
             # Verify shape implies experts are dim 0
             if gate_up_w.shape[0] == num_experts:
                 # Iterate and split
