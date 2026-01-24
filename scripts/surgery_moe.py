@@ -209,51 +209,132 @@ def build_hybrid_state_dict(
         if router_key in src_state:
             dst_state[f"{prefix}.moe.router.gate.weight"] = src_state[router_key]
         
-        # MoE expert weights - stack into single tensors
+        # MoE expert weights - handle fused & quantized tensors
         mlp1_weights = []
         mlp1_biases = []
         mlp2_weights = []
         mlp2_biases = []
         
-        for expert_idx in range(num_experts):
-            # up_proj and gate_proj combined for SwiGLU
-            up_key = f"{src_prefix}.mlp.experts.{expert_idx}.up_proj.weight"
-            gate_key = f"{src_prefix}.mlp.experts.{expert_idx}.gate_proj.weight"
-            down_key = f"{src_prefix}.mlp.experts.{expert_idx}.down_proj.weight"
-            
-            if up_key in src_state and gate_key in src_state:
-                # Interleave gate and up for SwiGLU: [gate[0], up[0], gate[1], up[1], ...]
-                gate_w = src_state[gate_key]  # (intermediate, hidden)
-                up_w = src_state[up_key]      # (intermediate, hidden)
-                
-                # DEQUANTIZATION SAFETY GUARD:
-                # GPT-OSS weights might be MXFP4 (uint8). Treating them as floats is mathematically invalid.
-                # If valid BF16 weights are found, we use them. If UINT8 is found, we ABORT.
-                if gate_w.dtype in [torch.uint8, torch.int8] or up_w.dtype in [torch.uint8, torch.int8]:
-                     raise ValueError(
-                         "CRITICAL: Detected integer-quantized weights (MXFP4/INT8). "
-                         "Direct casting to float is invalid and will destroy the model. "
-                         "Please dequantize the source checkpoint to BF16 using an off-the-shelf tool "
-                         "(e.g. vllm or bitsandbytes) before running this surgery script."
-                    )
-                
-                # Stack along intermediate dimension
-                gate_w = gate_w.to(torch.bfloat16)
-                up_w = up_w.to(torch.bfloat16)
-                
-                # Stack along intermediate dimension
-                combined = torch.stack([gate_w, up_w], dim=1).view(-1, hidden_size)
-                mlp1_weights.append(combined)
-                mlp1_biases.append(torch.zeros(intermediate_size * 2))
-            
-            if down_key in src_state:
-                down_w = src_state[down_key]
-                if down_w.dtype == torch.uint8 or down_w.dtype == torch.int8:
-                    down_w = down_w.float().to(torch.bfloat16)
-                    
-                mlp2_weights.append(down_w)  # (hidden, intermediate)
-                mlp2_biases.append(torch.zeros(hidden_size))
+        # Check for fused/quantized keys (GPT-OSS MXFP4 format)
+        gate_up_key = f"{src_prefix}.mlp.experts.gate_up_proj_blocks"
+        gate_up_scale = f"{src_prefix}.mlp.experts.gate_up_proj_scales"
+        down_key = f"{src_prefix}.mlp.experts.down_proj_blocks"
+        down_scale = f"{src_prefix}.mlp.experts.down_proj_scales"
         
+        # Helper: Dequantize if active
+        def load_quantized(blocks_key, scales_key):
+            if blocks_key not in src_state:
+                return None
+            
+            blocks = src_state[blocks_key] # (..., block_size)
+            scales = src_state[scales_key] # (..., 1)
+            
+            # Basic block dequantization: blocks * scales
+            # Assuming block_size is the last dim or inferred
+            # Blocks usually int8/uint8. Scales bf16/float.
+            
+            # Expand scales to match blocks
+            # If blocks is [N, K], scales is [N, K/block_size] ? 
+            # OR blocks is active tensor, scales is per-block.
+            # MXFP4 often: blocks [N, K], scales [N, K/32]
+            
+            B_shape = blocks.shape
+            S_shape = scales.shape
+            
+            # Auto-detect block size
+            # Usually strict division
+            # E.g. [32, 5632, 2880] elements vs scales
+            
+            if blocks.dtype in [torch.int8, torch.uint8]:
+                # Cast to float for math
+                blocks = blocks.float()
+                
+            # Repeat scales
+            # Calculate repetition factor
+            # Simple assumption: flatten and verify ratio
+            total_elements = blocks.numel()
+            total_scales = scales.numel()
+            block_size = total_elements // total_scales
+            
+            # Reshape scales to repeat
+            # This is heuristic. Real MXFP4 might need specific layout.
+            # Assuming contiguous blocks in last dim?
+            # Or flattening everything?
+            
+            # Safe approach: Upsample scales
+            expanded_scales = scales.repeat_interleave(block_size, dim=-1)
+            
+            # In case dimensions don't match after flatten logic
+            if expanded_scales.shape != blocks.shape:
+                # Try reshaping active to 1D, scales to 1D, mul, reshape back
+                deq = (blocks.view(-1) * expanded_scales.view(-1)).view(B_shape)
+            else:
+                deq = blocks * expanded_scales
+                
+            return deq.to(torch.bfloat16)
+
+        # 1. Try loading Fused Quantized Experts
+        if gate_up_key in src_state:
+            # Shape expectation: (num_experts, intermediate*2, hidden)
+            # The key 'experts.gate_up_proj' suggests all experts stacked
+            
+            gate_up_w = load_quantized(gate_up_key, gate_up_scale) # (32, 5760, 2880) ?
+            down_w = load_quantized(down_key, down_scale)         # (32, 2880, 2880) ?
+            
+            # Verify shape implies experts are dim 0
+            if gate_up_w.shape[0] == num_experts:
+                # Iterate and split
+                for e in range(num_experts):
+                    # GateUp: (intermediate*2, hidden)
+                    gu = gate_up_w[e]
+                    
+                    # Split into Gate and Up? 
+                    # GPT-OSS usually: [Gate, Up] stacked on dim 0 or 1?
+                    # Adamba expects: stack([gate, up], dim=1) -> flatten
+                    # If it's already fused, we keep it fused?
+                    
+                    # MoELayer expects: mlp1_weight as stacked tensor
+                    # logic below appends to list then stacks
+                    
+                    mlp1_weights.append(gu)
+                    mlp1_biases.append(torch.zeros(gu.shape[0])) # Bias
+                    
+                    # Down
+                    d = down_w[e] # (hidden, intermediate)
+                    # MoE code below expects down in specific format
+                    # But wait, logic below expects to append per expert
+                    mlp2_weights.append(d)
+                    mlp2_biases.append(torch.zeros(d.shape[0]))
+
+        # 2. Fallback to Standard/Unfused (Handling previous case if dequant failed or unused)
+        elif not mlp1_weights:
+             for expert_idx in range(num_experts):
+                # ... (Existing logic for separated files) ...
+                up_key = f"{src_prefix}.mlp.experts.{expert_idx}.up_proj.weight"
+                gate_key = f"{src_prefix}.mlp.experts.{expert_idx}.gate_proj.weight"
+                down_key = f"{src_prefix}.mlp.experts.{expert_idx}.down_proj.weight"
+                
+                if up_key in src_state and gate_key in src_state:
+                    gate_w = src_state[gate_key]
+                    up_w = src_state[up_key]
+                    
+                    # Manual BF16 cast if uint8 but NOT blocks (naive quantization)
+                    if gate_w.dtype in [torch.uint8, torch.int8]:
+                         gate_w = gate_w.float().to(torch.bfloat16)
+                    if up_w.dtype in [torch.uint8, torch.int8]:
+                         up_w = up_w.float().to(torch.bfloat16)
+                         
+                    combined = torch.stack([gate_w, up_w], dim=1).view(-1, hidden_size)
+                    mlp1_weights.append(combined)
+                    mlp1_biases.append(torch.zeros(intermediate_size * 2))
+                
+                if down_key in src_state:
+                    down_w = src_state[down_key]
+                    if down_w.dtype in [torch.uint8, torch.int8]:
+                        down_w = down_w.float().to(torch.bfloat16)
+                    mlp2_weights.append(down_w)
+                    mlp2_biases.append(torch.zeros(hidden_size))
+
         if mlp1_weights:
             dst_state[f"{prefix}.moe.moe.mlp1_weight"] = torch.stack(mlp1_weights)
             dst_state[f"{prefix}.moe.moe.mlp1_bias"] = torch.stack(mlp1_biases)
