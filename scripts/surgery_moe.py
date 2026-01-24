@@ -201,8 +201,8 @@ def build_hybrid_state_dict(
     
     # 4. Process layers
     std = (3 ** 0.5) * (hidden_size ** -0.5)
-    d_inner = hidden_size * 2  # Mamba expansion
-    d_state = 16
+    d_inner = hidden_size * 4  # Mamba expansion (expand=4 to match model config)
+    d_state = 64  # Match model's mamba_d_state
     d_conv = 4
     
     total_blocks = n_layers + n_mamba_layers
