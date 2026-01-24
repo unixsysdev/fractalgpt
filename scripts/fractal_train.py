@@ -497,7 +497,28 @@ def synthetic_data_loader():
 
 # Use synthetic data for testing, real data for actual training
 try:
-    tokenizer = get_tokenizer()
+    # Use correct tokenizer for model type
+    if args.model_type == "gptoss":
+        # GPT-OSS uses Qwen2 tokenizer (201k vocab)
+        from transformers import AutoTokenizer
+        hf_tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-7B")
+        print0(f"Using Qwen2 tokenizer for GPT-OSS (vocab size: {hf_tokenizer.vocab_size})")
+        
+        # Create a wrapper that matches our tokenizer interface
+        class TokenizerWrapper:
+            def __init__(self, hf_tok):
+                self.hf_tok = hf_tok
+            def encode(self, text):
+                return self.hf_tok.encode(text, add_special_tokens=False)
+            def decode(self, tokens):
+                return self.hf_tok.decode(tokens)
+            @property
+            def n_vocab(self):
+                return self.hf_tok.vocab_size
+        tokenizer = TokenizerWrapper(hf_tokenizer)
+    else:
+        tokenizer = get_tokenizer()
+    
     # Note: token_bytes is only needed for BPB evaluation, not training
     # Skip it here to allow training even without tok_train.py having been run
     train_loader = tokenizing_distributed_data_loader_bos_bestfit(
