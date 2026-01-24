@@ -40,6 +40,7 @@ from nanochat.common import (
 )
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit
+from nanochat.hybrid_gpt import HybridGPT, HybridConfig, HybridMoEGPT, GptOssMoEConfig
 from nanochat.matryoshka import (
     MLP_DIM_LEVELS, sample_dim_level, compute_energy_penalty,
 )
