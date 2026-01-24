@@ -6,6 +6,13 @@ Complete training pipeline for Adamba Agent with progressive expansion, CoT, fun
 
 **Provider:** HPC-AI.COM (8× H200 @ $1.96/GPU/hr = $15.68/hr)
 
+## Model Variants
+
+| Model | Base | Target | Est. Cost |
+|-------|------|--------|----------|
+| **nanochat-d32** | 1.88B | 22B | ~$940 |
+| **GPT-OSS 20B** | 20B (2.5B active) | ~25B | ~$1,500 |
+
 ## Training Phases
 
 | Phase | Type | Dim | Data | Hours | Cost |
@@ -183,3 +190,44 @@ torchrun --nproc_per_node=8 -m scripts.rl_train \
 | **Total** | | **60** | **$940** |
 
 **Alternative (Single Expansion to 2560):** Skip Phase 4, save ~$125
+
+---
+
+## GPT-OSS 20B Training Pipeline
+
+> **Branch:** `gptoss`
+
+### Model Specifications
+- Hidden: 2880 → 3584 → 4608
+- Layers: 24 attention+MoE + 12 Mamba = 36 total
+- Experts: 32 local, Top-4 routing
+- Quantization: MXFP4 (inference) / BF16 (training)
+
+### GPT-OSS Phases
+
+| Phase | Type | Dim | Hours | Cost |
+|-------|------|-----|-------|------|
+| **0** | Surgery (Mamba injection) | 2880 | 0 | $0 |
+| **1** | Mamba Integration | 2880 | ~25 | ~$400 |
+| **2** | Matryoshka + Gates | 2880 | ~20 | ~$315 |
+| **3** | Expansion to 3584 | 3584 | ~15 | ~$235 |
+| **4** | Expansion to 4608 | 4608 | ~12 | ~$188 |
+| **5** | CoT + Tools SFT | 4608 | ~15 | ~$235 |
+| **6** | RL (GRPO) | 4608 | ~8 | ~$125 |
+| | | **Total** | **~95 hrs** | **~$1,500** |
+
+### GPT-OSS Commands
+
+```bash
+# Download model
+huggingface-cli download openai/gpt-oss-20b --include "original/*" --local-dir gpt-oss-20b/
+
+# Surgery: inject Mamba layers
+python -m scripts.surgery_moe --src gpt-oss-20b/original --dst checkpoints/gptoss_hybrid.pt
+
+# Phase 1: Train Mamba (frozen MoE)
+torchrun --nproc_per_node=8 -m scripts.fractal_train \
+    --phase=1 \
+    --model-type=gptoss \
+    --checkpoint=checkpoints/gptoss_hybrid.pt
+```

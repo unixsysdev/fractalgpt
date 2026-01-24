@@ -835,3 +835,79 @@ class HybridGPT(nn.Module):
             avg_conf = torch.stack([c.mean() for c in intermediates['confidences']]).mean().item()
             
             yield token, avg_conf
+
+
+# =============================================================================
+# GPT-OSS MoE Configuration and Model
+# =============================================================================
+
+@dataclass
+class GptOssMoEConfig:
+    """Configuration for GPT-OSS 20B MoE hybrid model."""
+    # Model dimensions
+    hidden_size: int = 2880
+    intermediate_size: int = 2880
+    vocab_size: int = 201088
+    
+    # Layer structure
+    num_hidden_layers: int = 24
+    n_mamba_layers: int = 12  # Interleaved Mamba layers
+    
+    # Attention
+    num_attention_heads: int = 64
+    num_key_value_heads: int = 8
+    head_dim: int = 64
+    sliding_window: int = 128
+    max_position_embeddings: int = 131072
+    
+    # MoE
+    num_experts: int = 32
+    experts_per_token: int = 4
+    swiglu_limit: float = 7.0
+    router_aux_loss_coef: float = 0.01
+    
+    # Mamba
+    mamba_d_state: int = 16
+    mamba_d_conv: int = 4
+    mamba_expand: int = 2
+    
+    # Matryoshka (for dimension scaling)
+    mlp_dim_levels: List[int] = field(default_factory=lambda: [720, 1440, 2160, 2880, 3584, 4608])
+    
+    # Reasoning level thresholds (maps to early exit)
+    reasoning_thresholds: Dict[str, float] = field(default_factory=lambda: {
+        "low": 0.5,    # Exit at 50% confidence
+        "medium": 0.8,  # Exit at 80% confidence
+        "high": 0.95,   # Exit at 95% confidence
+    })
+
+
+class HybridMoEGPT(nn.Module):
+    """
+    GPT-OSS 20B MoE with Mamba layers and Matryoshka scaling.
+    
+    Architecture:
+    - 24 GPT-OSS attention+MoE blocks
+    - 12 interleaved Mamba blocks (after every 2 attention layers)
+    - Total: 36 blocks
+    
+    This is a placeholder for the full implementation.
+    TODO: Implement full forward pass with MoE routing and Mamba integration.
+    """
+    
+    def __init__(self, config: GptOssMoEConfig):
+        super().__init__()
+        self.config = config
+        
+        # Placeholder - full implementation needed
+        raise NotImplementedError(
+            "HybridMoEGPT is a placeholder. The full implementation requires:\n"
+            "1. MoE attention blocks with sliding/full attention alternation\n"
+            "2. MoE feed-forward with Top-4 routing\n"
+            "3. Interleaved Mamba blocks\n"
+            "4. Matryoshka dimension slicing\n"
+            "5. Early exit based on reasoning level\n"
+            "\n"
+            "For now, use surgery_moe.py to convert GPT-OSS checkpoints,\n"
+            "then load with a modified HybridGPT that understands MoE blocks."
+        )
