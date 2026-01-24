@@ -192,12 +192,37 @@ if args.model_type == "gptoss":
         model = HybridMoEGPT(config)
         
 else:
-    # Standard NanoChat config
+    # Standard Nano# Determine layer counts
+    n_layer = args.depth
+    n_mamba = args.n_mamba
+
+    # 1. Prioritize checkpoint config
+    if checkpoint_config:
+        if "n_layer" in checkpoint_config:
+            n_layer = checkpoint_config["n_layer"]
+            print0(f"Using n_layer from checkpoint: {n_layer}")
+        if "n_mamba_layer" in checkpoint_config:
+            n_mamba = checkpoint_config["n_mamba_layer"]
+            print0(f"Using n_mamba_layer from checkpoint: {n_mamba}")
+
+    # 2. If using GPT-OSS and still on defaults, force correct values
+    if args.model_type == "gptoss":
+        # If user didn't specify depth (still default 32)
+        if n_layer == 32 and args.depth == 32:
+            n_layer = 24
+            print0(f"Overriding to GPT-OSS default n_layer: {n_layer}")
+        
+        # If user didn't specify n_mamba (still default 32)
+        if n_mamba == 32 and args.n_mamba == 32:
+            n_mamba = 12
+            print0(f"Overriding to GPT-OSS default n_mamba: {n_mamba}")
+
+    # Create config
     config = HybridConfig(
         sequence_len=args.max_seq_len,
         vocab_size=vocab_size,
-        n_layer=args.depth,
-        n_mamba_layer=args.n_mamba,
+        n_layer=n_layer,
+        n_mamba_layer=n_mamba,
         n_head=expanded_dim // args.head_dim,
         n_kv_head=expanded_dim // args.head_dim,
         n_embd=args.base_dim,
