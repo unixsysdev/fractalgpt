@@ -374,8 +374,9 @@ if ddp:
     orig_model = model.module if ddp else model
     
     num_params = sum(p.numel() for p in model.parameters())
+    _, _, world_size_local, _ = get_dist_info()
     print0(f"Memory-Allocated Parameters (Per-GPU Shard): {num_params:,}")
-    print0(f"Estimated Total Model Size: {num_params * world_size:,} (approx)")
+    print0(f"Estimated Total Model Size: {num_params * world_size_local:,} (approx)")
 
 # -----------------------------------------------------------------------------
 # Phase-specific freeze/unfreeze and Matryoshka settings
