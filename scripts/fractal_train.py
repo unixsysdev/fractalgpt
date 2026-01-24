@@ -596,7 +596,19 @@ while step < args.num_iterations:
                     metrics.update(dim_metrics)
             else:
                 # Standard training at full dim
-                loss = orig_model(x, y)
+                # Use FSDP-wrapped model, not orig_model (which has empty tensors on non-rank-0)
+                if hasattr(model, 'module'):
+                    # FSDP wraps the model, need to call FSDP model for distributed forward
+                    outputs = model(x)
+                    if isinstance(outputs, tuple):
+                        logits, aux_loss = outputs
+                    else:
+                        logits, aux_loss = outputs, 0.0
+                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+                    if aux_loss:
+                        loss = loss + aux_loss
+                else:
+                    loss = model(x, y)
         
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
