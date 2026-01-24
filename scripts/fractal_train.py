@@ -180,11 +180,25 @@ if args.model_type == "gptoss" and vocab_size == 65536:
 # Create config and model based on type
 if args.model_type == "gptoss":
     print0("Initializing GPT-OSS 20B MoE model architecture...")
+    
+    # Use correct defaults for GPT-OSS
+    gptoss_depth = args.depth if args.depth != 32 else 24
+    gptoss_n_mamba = args.n_mamba if args.n_mamba != 32 else 12
+    
+    # Also check checkpoint config
+    if checkpoint_config:
+        if "n_layer" in checkpoint_config:
+            gptoss_depth = checkpoint_config["n_layer"]
+        if "n_mamba_layer" in checkpoint_config:
+            gptoss_n_mamba = checkpoint_config["n_mamba_layer"]
+    
+    print0(f"  GPT-OSS layers: {gptoss_depth} attention + {gptoss_n_mamba} mamba")
+    
     # Map CLI args to MoE config
     config = GptOssMoEConfig(
         vocab_size=vocab_size,
-        num_hidden_layers=args.depth, # Should be 24 for GPT-OSS
-        n_mamba_layers=args.n_mamba,  # Should be 12
+        num_hidden_layers=gptoss_depth,
+        n_mamba_layers=gptoss_n_mamba,
         num_attention_heads=64,       # Fixed for GPT-OSS 20B
         num_key_value_heads=8,        # Fixed
         head_dim=64,                  # Fixed
