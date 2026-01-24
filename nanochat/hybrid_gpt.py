@@ -154,7 +154,14 @@ class MatryoshkaAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
         
+        
         # Flash Attention
+        # Ensure inputs are bfloat16 or float16 for FlashAttention using Tensor Cores
+        if q.dtype == torch.float32:
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
+            v = v.to(torch.bfloat16)
+            
         if kv_cache is None:
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
