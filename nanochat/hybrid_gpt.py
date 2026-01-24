@@ -867,10 +867,10 @@ class GptOssMoEConfig:
     swiglu_limit: float = 7.0
     router_aux_loss_coef: float = 0.01
     
-    # Mamba
-    mamba_d_state: int = 16
+    # Mamba - scaled for 20B model
+    mamba_d_state: int = 64   # Increased from 16
     mamba_d_conv: int = 4
-    mamba_expand: int = 2
+    mamba_expand: int = 4     # Increased from 2 for ~1.2B mamba params total
     
     # Matryoshka (for dimension scaling)
     mlp_dim_levels: List[int] = field(default_factory=lambda: [720, 1440, 2160, 2880, 3584, 4608])
