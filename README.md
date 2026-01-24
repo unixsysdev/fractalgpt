@@ -6,6 +6,40 @@
 
 *Also known as: ElasticGPT • Accordion-Net • Dynamic Compute Budget Model*
 
+## GPT-OSS 20B MoE Integration 🚀
+
+**NEW:** Adamba now supports GPT-OSS 20B MoE as a base model!
+
+```bash
+# 1. Run surgery to create hybrid checkpoint
+python scripts/surgery_moe.py --dst=/path/to/gptoss_hybrid.pt
+
+# 2. Train Phase 1 (Mamba integration)
+torchrun --nproc_per_node=8 -m scripts.fractal_train \
+    --phase=1 --model-type=gptoss --depth=24 \
+    --checkpoint=/path/to/gptoss_hybrid.pt \
+    --gradient-checkpointing \
+    --device-batch-size=20
+```
+
+### Architecture (GPT-OSS + Mamba)
+
+| Component | Count | Details |
+|-----------|-------|---------|
+| Attention+MoE Blocks | 24 | Frozen in Phase 1 |
+| Mamba Blocks | 12 | Trainable (9% of params) |
+| Total Parameters | 22.7B | |
+| MoE Experts | 32 per layer | Top-2 routing |
+
+### Phase 1 Training
+
+- **Goal:** Train Mamba to pass-through (minimal interference)
+- **Frozen:** Attention + MoE layers (original GPT-OSS knowledge preserved)
+- **Trainable:** Mamba layers only (~2B params)
+- **Hardware:** 8×H200 (143GB each), ~80GB/GPU utilization
+- **Throughput:** ~77k tok/s
+
+---
 
 ## Architecture Overview
 
@@ -38,68 +72,33 @@ Adamba combines three efficiency techniques into a unified pipeline:
 
 **Key insight**: Resizing SSM states on the fly is mathematically messy. Resizing Attention heads is trivial. Keep Mamba static, make Attention/MLP dynamic.
 
-## Validated Results
-
-```
-tiny_experiment validation:
-  Early exits: 71.5%  (37.5% compute saved!)
-  Gate loss:   0.28 → 0.03  (self-supervised difficulty learning)
-  Hard tasks get more dims than easy tasks ✓
-```
-
-The gate trains itself using **shadow loss**: comparing what loss *would be* at each layer to teach the gate when it's safe to exit.
-
-## Architecture
-
-```
-nanochat-d32 (1.9B, 32 layers, dim=2048)
-    ↓ Surgery (add 32 Mamba layers)
-Stage 1: 6.4B  (dim=2048)  ← Hybrid, no expansion
-    ↓ Progressive expand
-Stage 2: 9.3B  (dim=2560)  
-    ↓ Progressive expand
-Stage 3: 20B   (dim=4096)
-```
-
-## Training Cost
-
-| Stage | Model Size | Dim | Hours (8×H100) | Est. Cost |
-|-------|------------|-----|----------------|-----------|
-| 1 | 6.4B | 2048 | 40h | $1,000 |
-| 2 | 9.3B | 2560 | 50h | $1,200 |
-| 3 | 20B | 4096 | 100h | $2,400 |
-| **Total** | | | **190h** | **~$4,600** |
-
-## Quick Start
-
-```bash
-# 1. Download nanochat-d32 base
-huggingface-cli download karpathy/nanochat-d32 \
-    --local-dir ~/.cache/nanochat/chatsft_checkpoints/d32
-
-# 2. Create 6.4B hybrid
-python -m scripts.surgery --new-dim=2048
-
-# 3. Train Stage 1
-torchrun --nproc_per_node=8 -m scripts.fractal_train \
-    --checkpoint ~/.cache/nanochat/hybrid_checkpoints/d32_2048/model.pt \
-    --expanded-dim=2048 --matryoshka --sample-dim
-
-# 4. Expand → Stage 2
-python -m scripts.surgery --expand-from=2048 --new-dim=2560
-```
-
 ## Files
 
 | File | Purpose |
 |------|---------|
 | `nanochat/hybrid_gpt.py` | Adamba model (Mamba+Attention+Gate) |
 | `nanochat/mamba_block.py` | Static Mamba with SSM fallback |
-| `nanochat/matryoshka.py` | Dimension slicing + energy loss |
-| `nanochat/confidence_probe.py` | V2: LayerDimPredictor, ConfidenceGate |
-| `scripts/surgery.py` | Create/expand hybrid checkpoints |
-| `scripts/fractal_train.py` | Matryoshka training |
-| `tiny_experiment/` | Local validation suite |
+| `nanochat/moe_block.py` | MoE layer for GPT-OSS |
+| `scripts/surgery_moe.py` | GPT-OSS → Adamba hybrid conversion |
+| `scripts/fractal_train.py` | Distributed training with FSDP |
+
+## Training Pipeline
+
+### Phase-Aware Training
+
+| Phase | Command | What Trains | Matryoshka |
+|-------|---------|-------------|------------|
+| **1** | `--phase=1` | Mamba only (frozen attn/MoE) | ✗ Off |
+| **2** | `--phase=2` | All + Gates | ✓ On |
+| **3** | `--phase=3` | Expanded weights | ✓ On |
+
+```bash
+# Phase 1: Integrate Mamba (freeze attention)
+torchrun -m scripts.fractal_train --phase=1 --model-type=gptoss --checkpoint=phase1.pt
+
+# Phase 2: Matryoshka + Gates (unfreeze all)
+torchrun -m scripts.fractal_train --phase=2 --model-type=gptoss --checkpoint=phase2.pt
+```
 
 ## Compute Modes
 
@@ -109,60 +108,6 @@ python -m scripts.surgery --expand-from=2048 --new-dim=2560
 | Whisper | 512 | ~6% | Simple Q&A |
 | Normal | 1024 | ~25% | General use |
 | Think | 2048+ | 100% | Complex reasoning |
-
-## Related Work
-
-- **Matryoshka Embeddings** (OpenAI/Harvard): MRL applied to model weights
-- **FastBERT / DeeBERT**: Confidence-based early exit
-- **Mixture of Depths** (Google DeepMind): Dynamic FLOP allocation
-
----
-
-## Training Pipeline
-
-### Phase-Aware Training (Implemented ✓)
-
-Use `--phase` flag in `scripts/fractal_train.py`:
-
-| Phase | Command | What Trains | Matryoshka |
-|-------|---------|-------------|------------|
-| **1** | `--phase=1` | Mamba only (frozen attn/mlp) | ✗ Off |
-| **2** | `--phase=2` | All + Gates | ✓ On |
-| **3** | `--phase=3` | Expanded weights | ✓ On |
-
-```bash
-# Phase 1: Integrate Mamba (freeze attention)
-torchrun -m scripts.fractal_train --phase=1 --checkpoint=phase1.pt
-
-# Phase 2: Matryoshka + Gates (unfreeze all)
-torchrun -m scripts.fractal_train --phase=2 --checkpoint=phase2.pt
-
-# Phase 3: After expansion surgery
-torchrun -m scripts.fractal_train --phase=3 --checkpoint=phase3.pt
-```
-
-### Smarter Expansion Initialization (Implemented ✓)
-
-**Mamba (Stage 1):** Uses `zero-init` ✓ (correct, nothing to copy)
-
-**MLP/Attention Expansion (Stage 2/3):** Uses LoRA-style initialization:
-```python
-# Instead of zeros, new dims = A @ B (low-rank, small init)
-expand_weight_lora(weight, target_size, dim, rank=16, std=0.01)
-```
-
-### Attention Weight Interleaving (Implemented ✓)
-
-**Problem Solved:** MHA weights are stored as `[Head1 | Head2 | ... | Head16]`.
-
-**Solution:** `expand_attention_interleaved()` expands each head's dims separately:
-```
-[Head1_128+32 | Head2_128+32 | ... | Head16_128+32]  ← CORRECT
-```
-
-Functions in `scripts/surgery.py`:
-- `expand_weight_lora()` - LoRA-style low-rank initialization
-- `expand_attention_interleaved()` - Per-head dimension expansion
 
 ---
 
