@@ -2,7 +2,7 @@
 
 > **Ad**aptive **Mamba**: Elastic compute with dynamic Matryoshka scaling
 
-🤗 **[Model on HuggingFace](https://huggingface.co/datasysdev/adamba)** | 📂 **[GitHub](https://github.com/unixsysdev/adamba)**
+🤗 **[Original Model](https://huggingface.co/datasysdev/adamba)** | 🤗 **[GPT-OSS 20B MoE](https://huggingface.co/datasysdev/gptoss-adamba)** | 📂 **[GitHub](https://github.com/unixsysdev/adamba)**
 
 *Also known as: ElasticGPT • Accordion-Net • Dynamic Compute Budget Model*
 
