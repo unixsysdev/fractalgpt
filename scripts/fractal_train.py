@@ -477,6 +477,9 @@ else:
     print0("  Using AdamW optimizer (model has no setup_optimizers)")
     trainable_params_list = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params_list, lr=args.matrix_lr, betas=(0.9, 0.95), weight_decay=0.1)
+    # Set initial_lr for LR scheduler compatibility
+    for group in optimizer.param_groups:
+        group["initial_lr"] = group["lr"]
     optimizers = [optimizer]
     muon_optimizer = None
 
