@@ -461,15 +461,22 @@ print0(f"Trainable parameters: {trainable_params:,} ({100*trainable_params/num_p
 # Optimizer setup
 print0("Setting up optimizers...")
 
-optimizers = orig_model.setup_optimizers(
-    matrix_lr=args.matrix_lr,
-    embedding_lr=args.embedding_lr,
-    probe_lr=args.probe_lr,
-    no_muon=args.no_muon,
-)
-
-# Get Muon optimizer for momentum scheduling
-muon_optimizer = optimizers[1] if len(optimizers) > 1 and not args.no_muon else None
+# Handle models with/without setup_optimizers method
+if hasattr(orig_model, 'setup_optimizers'):
+    optimizers = orig_model.setup_optimizers(
+        matrix_lr=args.matrix_lr,
+        embedding_lr=args.embedding_lr,
+        probe_lr=args.probe_lr,
+        no_muon=args.no_muon,
+    )
+    muon_optimizer = optimizers[1] if len(optimizers) > 1 and not args.no_muon else None
+else:
+    # Fallback for HybridMoEGPT: simple AdamW optimizer
+    print0("  Using AdamW optimizer (model has no setup_optimizers)")
+    trainable_params_list = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(trainable_params_list, lr=args.matrix_lr, betas=(0.9, 0.95), weight_decay=0.1)
+    optimizers = [optimizer]
+    muon_optimizer = None
 
 # -----------------------------------------------------------------------------
 # Data loader
