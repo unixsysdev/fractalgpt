@@ -681,7 +681,17 @@ while step < args.num_iterations:
             backup_dir = Path("/mnt/pt/adamba_checkpoints")
             backup_dir.mkdir(parents=True, exist_ok=True)
             backup_path = backup_dir / "latest_checkpoint.pt"
-            torch.save(orig_model.state_dict(), backup_path)
+            
+            # FSDP requires special handling to get full state dict
+            if ddp:
+                from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+                save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+                    state_dict = model.state_dict()
+                    if master_process:
+                        torch.save(state_dict, backup_path)
+            else:
+                torch.save(model.state_dict(), backup_path)
             
             # Checkpoint rotation: keep only last N
             if args.keep_checkpoints > 0 and len(saved_checkpoints) > args.keep_checkpoints:
@@ -710,15 +720,21 @@ while step < args.num_iterations:
 
 # Final checkpoint
 if master_process:
-    final_path = checkpoint_dir / f"model_final.pt"
-    torch.save(orig_model.state_dict(), final_path)
-    # Also backup to persistent storage
-    backup_dir = Path("/root/highspeedstorage/AdambaCheckpoints")
+    backup_dir = Path("/mnt/pt/adamba_checkpoints")
     backup_dir.mkdir(parents=True, exist_ok=True)
-    backup_final = backup_dir / f"phase{args.phase}_final.pt"
-    torch.save(orig_model.state_dict(), backup_final)
+    final_path = backup_dir / f"phase{args.phase}_final.pt"
+    
+    # FSDP requires special handling to get full state dict
+    if ddp:
+        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+            state_dict = model.state_dict()
+            torch.save(state_dict, final_path)
+    else:
+        torch.save(model.state_dict(), final_path)
+    
     print0(f"Training complete! Final checkpoint: {final_path}")
-    print0(f"Backup saved to: {backup_final}")
 
 if ddp:
     dist.destroy_process_group()
