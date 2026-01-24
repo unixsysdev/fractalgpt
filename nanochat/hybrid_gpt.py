@@ -896,6 +896,7 @@ class HybridMoEGPT(nn.Module):
     def __init__(self, config: GptOssMoEConfig):
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False  # Set via training script
         
         # Dimensions
         self.hidden_size = config.hidden_size
@@ -1009,14 +1010,26 @@ class HybridMoEGPT(nn.Module):
                 level_idx = layer_dims[i]
                 target_dim = self.config.mlp_dim_levels[level_idx]
             
-            # Forward block
-            # If Mamba: just x
-            # If GPT-OSS: x + aux_loss
-            if isinstance(block, GptOssBlock):
-                x, aux_loss = block(x, active_dim=target_dim)
-                total_aux_loss += aux_loss
+            # Forward block with optional checkpointing
+            if self.gradient_checkpointing and self.training:
+                from torch.utils.checkpoint import checkpoint
+                if isinstance(block, GptOssBlock):
+                    def create_custom_forward(module):
+                        def custom_forward(x, dim):
+                            return module(x, active_dim=dim)
+                        return custom_forward
+                    x, aux_loss = checkpoint(create_custom_forward(block), x, target_dim, use_reentrant=False)
+                    total_aux_loss += aux_loss
+                else:
+                    x = checkpoint(block, x, use_reentrant=False)
             else:
-                x = block(x) # Mamba
+                # If Mamba: just x
+                # If GPT-OSS: x + aux_loss
+                if isinstance(block, GptOssBlock):
+                    x, aux_loss = block(x, active_dim=target_dim)
+                    total_aux_loss += aux_loss
+                else:
+                    x = block(x) # Mamba
                 
         x = self.final_norm(x)
         logits = self.lm_head(x)
