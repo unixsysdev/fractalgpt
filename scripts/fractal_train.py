@@ -704,13 +704,13 @@ while step < args.num_iterations:
                 wandb_run.log({f"eval/loss_dim_{dim}": eval_loss.item(), "step": step})
         model.train()
     
-    # Checkpointing - save only once to persistent storage
+    # Checkpointing - save to fast local storage
     if args.save_every > 0 and step > 0 and step % args.save_every == 0:
         if master_process:
-            # Save to persistent backup storage only (no double save)
-            backup_dir = Path("/mnt/pt/adamba_checkpoints")
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            backup_path = backup_dir / "latest_checkpoint.pt"
+            # Save to fast local storage (/tmp is NVMe)
+            local_dir = Path("/tmp/adamba_checkpoints")
+            local_dir.mkdir(parents=True, exist_ok=True)
+            local_path = local_dir / "latest_checkpoint.pt"
             
             # FSDP requires special handling to get full state dict
             if ddp:
@@ -727,13 +727,15 @@ while step < args.num_iterations:
                     for k, v in state_dict.items():
                         if v.dtype == torch.float32:
                             state_dict[k] = v.to(torch.bfloat16)
-                    torch.save(state_dict, backup_path)
+                    torch.save(state_dict, local_path)
                     del state_dict  # Free memory
+                    print0(f"Saved checkpoint: {local_path}")
+                    print0(f"  Copy to NFS: cp {local_path} /mnt/pt/adamba_checkpoints/")
                 
                 # Another barrier after save
                 dist.barrier()
             else:
-                torch.save(model.state_dict(), backup_path)
+                torch.save(model.state_dict(), local_path)
             
             # Checkpoint rotation: keep only last N
             if args.keep_checkpoints > 0 and len(saved_checkpoints) > args.keep_checkpoints:
