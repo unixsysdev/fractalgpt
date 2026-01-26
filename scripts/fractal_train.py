@@ -705,37 +705,34 @@ while step < args.num_iterations:
         model.train()
     
     # Checkpointing - save to fast local storage
+    # NOTE: ALL ranks must participate in FSDP state_dict gathering, only rank 0 saves
     if args.save_every > 0 and step > 0 and step % args.save_every == 0:
-        if master_process:
-            # Save to fast local storage (/tmp is NVMe)
-            local_dir = Path("/tmp/adamba_checkpoints")
-            local_dir.mkdir(parents=True, exist_ok=True)
-            local_path = local_dir / "latest_checkpoint.pt"
+        local_dir = Path("/tmp/adamba_checkpoints")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        local_path = local_dir / "latest_checkpoint.pt"
+        
+        # FSDP requires ALL ranks to participate in state dict gathering
+        if ddp:
+            from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+            save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+            with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+                state_dict = model.state_dict()
             
-            # FSDP requires special handling to get full state dict
-            if ddp:
-                from torch.distributed.fsdp import FullStateDictConfig, StateDictType
-                save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
-                    state_dict = model.state_dict()
-                
-                # Barrier to ensure all ranks complete before continuing training
-                dist.barrier()
-                
-                if master_process:
-                    # Convert to bfloat16 for smaller checkpoint (~45GB instead of ~90GB)
-                    for k, v in state_dict.items():
-                        if v.dtype == torch.float32:
-                            state_dict[k] = v.to(torch.bfloat16)
-                    torch.save(state_dict, local_path)
-                    del state_dict  # Free memory
-                    print0(f"Saved checkpoint: {local_path}")
-                    print0(f"  Copy to NFS: cp {local_path} /mnt/pt/adamba_checkpoints/")
-                
-                # Another barrier after save
-                dist.barrier()
-            else:
-                torch.save(model.state_dict(), local_path)
+            # Only rank 0 has the full state dict (rank0_only=True)
+            if master_process:
+                # Convert to bfloat16 for smaller checkpoint (~45GB instead of ~90GB)
+                for k, v in state_dict.items():
+                    if v.dtype == torch.float32:
+                        state_dict[k] = v.to(torch.bfloat16)
+                torch.save(state_dict, local_path)
+                del state_dict
+                print0(f"Saved checkpoint: {local_path}")
+                print0(f"  Copy to NFS: cp {local_path} /mnt/pt/adamba_checkpoints/")
+            
+            # Barrier after save
+            dist.barrier()
+        else:
+            torch.save(model.state_dict(), local_path)
             
             # Checkpoint rotation: keep only last N
             if args.keep_checkpoints > 0 and len(saved_checkpoints) > args.keep_checkpoints:
